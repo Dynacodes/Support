@@ -5,8 +5,8 @@ Telegram support bot: license-key purchase flow + live agent relay.
 Runs as a Render Web Service (webhook mode).
 
 Env vars required:
-  BOT_TOKEN     - 8974038484:AAF1u0OSN66FyU7yfrRQEUzc_bgHQtpIQyE
-  ADMIN_ID      - 7596633569
+  BOT_TOKEN     - from @BotFather
+  ADMIN_ID      - your numeric Telegram user id (from @userinfobot)
   WEBHOOK_URL   - your Render external URL, e.g. https://frop-support.onrender.com
 Optional:
   PORT          - injected by Render automatically
@@ -46,12 +46,13 @@ PORT = int(os.environ.get("PORT", "10000"))
 DB_PATH = os.environ.get("DB_PATH", "support.db")
 
 TOOLS = [
-    "FropLog",
+    "FropLogger",
     "FropTrack",
-    "Fropcasflaz",
-    "FropbybFlaz",
-    "Fropbiflaz",
-    "Fropzflaz",
+    "FropBinanceFlash",
+    "FropCashappFlash",
+    "FropBybitFlash",
+    "FropPaypalFlash",
+    "FropZelleFlash",
     "FropFlight",
 ]
 
