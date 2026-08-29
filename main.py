@@ -1,31 +1,29 @@
 """
-FropTools Support Bot
----------------------
+FropTools Support Bot — v2 (premium custom emoji)
+-------------------------------------------------
 Telegram support bot: license-key purchase flow + live agent relay.
 Runs as a Render Web Service (webhook mode).
 
-Env vars required:
-  BOT_TOKEN     - from @BotFather
-  ADMIN_ID      - your numeric Telegram user id (from @userinfobot)
-  WEBHOOK_URL   - your Render external URL, e.g. https://frop-support.onrender.com
-Optional:
-  PORT          - injected by Render automatically
-  DB_PATH       - defaults to support.db
+Env vars:
+  BOT_TOKEN        - from @BotFather                              (required)
+  ADMIN_ID         - your numeric Telegram user id                (required)
+  WEBHOOK_URL      - falls back to RENDER_EXTERNAL_URL            (optional)
+  PREMIUM_EMOJI    - "1" (default) / "0" to force plain unicode   (optional)
+  DB_PATH          - defaults to support.db                       (optional)
 """
 
+import asyncio
 import logging
 import os
+import re
 import secrets
 import sqlite3
 import string
 from datetime import datetime, timezone
 
-from telegram import (
-    InlineKeyboardButton,
-    InlineKeyboardMarkup,
-    Update,
-)
+from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.constants import ParseMode
+from telegram.error import BadRequest
 from telegram.ext import (
     Application,
     CallbackQueryHandler,
@@ -41,27 +39,23 @@ from telegram.ext import (
 
 BOT_TOKEN = os.environ["BOT_TOKEN"]
 ADMIN_ID = int(os.environ["ADMIN_ID"])
-WEBHOOK_URL = os.environ.get("WEBHOOK_URL", "").rstrip("/")
+WEBHOOK_URL = os.environ.get(
+    "WEBHOOK_URL", os.environ.get("RENDER_EXTERNAL_URL", "")
+).rstrip("/")
 PORT = int(os.environ.get("PORT", "10000"))
 DB_PATH = os.environ.get("DB_PATH", "support.db")
 
 TOOLS = [
-    "FropLogger",
+    "FropLog",
     "FropTrack",
-    "FropBinanceFlash",
-    "FropCashappFlash",
-    "FropBybitFlash",
-    "FropPaypalFlash",
-    "FropZelleFlash",
+    "Fropcasflaz",
+    "FropbybFlaz",
+    "Fropbiflaz",
+    "Fropzflaz",
     "FropFlight",
 ]
 
 DURATIONS = [30, 60, 90, 120, 360]
-
-WELCOME = (
-    "👋 <b>Welcome to Froptools Support Portal</b>\n\n"
-    "How may we help you today?"
-)
 
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
@@ -71,7 +65,111 @@ logging.getLogger("httpx").setLevel(logging.WARNING)
 log = logging.getLogger("frop-support")
 
 # ----------------------------------------------------------------------------
-# Storage (sqlite — survives restarts if you attach a Render disk)
+# Premium (custom) emoji layer
+# ----------------------------------------------------------------------------
+#
+# Telegram renders <tg-emoji emoji-id="..."> only under HTML parse mode.
+# Every entry carries a plain-unicode fallback, used when:
+#   * PREMIUM_EMOJI=0
+#   * the target surface can't render entities (inline buttons, etc.)
+#   * Telegram rejects the entity at send time (auto-degrade, see send_html)
+
+EMOJI = {
+    "gem":       ("5226656353744862682", "\U0001F48E"),    # 💎
+    "star":      ("5980995951160987855", "\u2B50"),        # ⭐
+    "check":     ("5278622189556354905", "\u2705"),        # ✅
+    "bolt":      ("5084974483685507801", "\u26A1"),        # ⚡
+    "cross":     ("5042112436648281096", "\u274C"),        # ❌
+    "globe":     ("5134452506935427991", "\U0001F30D"),    # 🌍
+    "user":      ("5321304384838057247", "\U0001F464"),    # 👤
+    "rocket":    ("5195033767969839232", "\U0001F680"),    # 🚀
+    "sparkle":   ("5172739056592749710", "\u2728"),        # ✨
+    "hourglass": ("5215327832040811010", "\u23F3"),        # ⏳
+    "info":      ("5303138782004924588", "\u2139\uFE0F"),  # ℹ️
+}
+
+# Flipped to False automatically if Telegram refuses custom emoji entities.
+PREMIUM_ENABLED = os.environ.get("PREMIUM_EMOJI", "1") != "0"
+
+_TG_EMOJI_RE = re.compile(r'<tg-emoji emoji-id="\d+">(.*?)</tg-emoji>', re.S)
+
+
+def e(name: str) -> str:
+    """Premium emoji markup (HTML parse mode) with unicode fallback."""
+    emoji_id, fallback = EMOJI[name]
+    if not PREMIUM_ENABLED:
+        return fallback
+    return f'<tg-emoji emoji-id="{emoji_id}">{fallback}</tg-emoji>'
+
+
+def plain(name: str) -> str:
+    """Plain unicode only — for inline button labels, which strip entities."""
+    return EMOJI[name][1]
+
+
+def degrade(text: str) -> str:
+    """Replace every <tg-emoji> wrapper with its inner unicode character."""
+    return _TG_EMOJI_RE.sub(r"\1", text)
+
+
+async def send_html(bot, chat_id: int, text: str, **kwargs):
+    """
+    send_message in HTML mode, degrading premium emoji if Telegram rejects them.
+
+    Custom emoji entities are only permitted for bots that bought a username on
+    Fragment. Rather than fail, we strip the tags once and remember the result
+    for the rest of the process lifetime.
+    """
+    global PREMIUM_ENABLED
+    try:
+        return await bot.send_message(
+            chat_id, text, parse_mode=ParseMode.HTML, **kwargs
+        )
+    except BadRequest as exc:
+        if "custom emoji" not in str(exc).lower():
+            raise
+        PREMIUM_ENABLED = False
+        log.warning("Custom emoji rejected by Telegram — falling back to unicode")
+        return await bot.send_message(
+            chat_id, degrade(text), parse_mode=ParseMode.HTML, **kwargs
+        )
+
+
+async def edit_html(query, text: str, **kwargs):
+    """Same degrade-on-failure behaviour for callback query edits."""
+    global PREMIUM_ENABLED
+    try:
+        return await query.edit_message_text(
+            text, parse_mode=ParseMode.HTML, **kwargs
+        )
+    except BadRequest as exc:
+        msg = str(exc).lower()
+        if "not modified" in msg:
+            return
+        if "custom emoji" not in msg:
+            raise
+        PREMIUM_ENABLED = False
+        log.warning("Custom emoji rejected by Telegram — falling back to unicode")
+        return await query.edit_message_text(
+            degrade(text), parse_mode=ParseMode.HTML, **kwargs
+        )
+
+
+# ----------------------------------------------------------------------------
+# Copy
+# ----------------------------------------------------------------------------
+
+
+def welcome_text() -> str:
+    return (
+        f"{e('sparkle')} <b>Welcome to Froptools Support Portal</b>\n"
+        f"{e('globe')} <i>Premium tools · instant licensing · live support</i>\n\n"
+        "How may we help you today?"
+    )
+
+
+# ----------------------------------------------------------------------------
+# Storage
 # ----------------------------------------------------------------------------
 
 
@@ -100,7 +198,7 @@ def init_db():
             );
             CREATE TABLE IF NOT EXISTS state (
                 user_id    INTEGER PRIMARY KEY,
-                mode       TEXT,           -- 'idle' | 'await_message' | 'live'
+                mode       TEXT,
                 tool       TEXT,
                 last_ref   TEXT
             );
@@ -113,7 +211,9 @@ def get_state(user_id: int) -> dict:
         row = conn.execute(
             "SELECT * FROM state WHERE user_id = ?", (user_id,)
         ).fetchone()
-    return dict(row) if row else {"user_id": user_id, "mode": "idle", "tool": None, "last_ref": None}
+    return dict(row) if row else {
+        "user_id": user_id, "mode": "idle", "tool": None, "last_ref": None
+    }
 
 
 def set_state(user_id: int, **kw):
@@ -147,19 +247,24 @@ def lookup_msg(admin_msg_id: int):
 def new_reference() -> str:
     alphabet = string.ascii_uppercase + string.digits
     while True:
-        ref = "FT-" + "".join(secrets.choice(alphabet) for _ in range(4)) + "-" + \
-              "".join(secrets.choice(alphabet) for _ in range(4))
+        ref = (
+            "FT-"
+            + "".join(secrets.choice(alphabet) for _ in range(4))
+            + "-"
+            + "".join(secrets.choice(alphabet) for _ in range(4))
+        )
         with db() as conn:
-            hit = conn.execute("SELECT 1 FROM tickets WHERE ref = ?", (ref,)).fetchone()
-        if not hit:
-            return ref
+            if not conn.execute(
+                "SELECT 1 FROM tickets WHERE ref = ?", (ref,)
+            ).fetchone():
+                return ref
 
 
 def save_ticket(ref, user, tool, days):
     with db() as conn:
         conn.execute(
-            "INSERT INTO tickets (ref, user_id, username, tool, days, status, created_at) "
-            "VALUES (?,?,?,?,?,?,?)",
+            "INSERT INTO tickets (ref, user_id, username, tool, days, status, "
+            "created_at) VALUES (?,?,?,?,?,?,?)",
             (
                 ref,
                 user.id,
@@ -173,25 +278,29 @@ def save_ticket(ref, user, tool, days):
 
 
 # ----------------------------------------------------------------------------
-# Keyboards
+# Keyboards  (button labels use plain unicode — Telegram strips entities here)
 # ----------------------------------------------------------------------------
 
 
 def main_menu() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         [
-            [InlineKeyboardButton("🔑 Buy License Key", callback_data="menu:buy")],
-            [InlineKeyboardButton("💬 Contact Live Agent", callback_data="menu:agent")],
+            [InlineKeyboardButton(
+                f"{plain('gem')}  Buy License Key", callback_data="menu:buy"
+            )],
+            [InlineKeyboardButton(
+                f"{plain('user')}  Contact Live Agent", callback_data="menu:agent"
+            )],
         ]
     )
 
 
 def tools_menu() -> InlineKeyboardMarkup:
     rows = [
-        [InlineKeyboardButton(name, callback_data=f"tool:{i}")]
+        [InlineKeyboardButton(f"{plain('star')}  {name}", callback_data=f"tool:{i}")]
         for i, name in enumerate(TOOLS)
     ]
-    rows.append([InlineKeyboardButton("⬅️ Back", callback_data="menu:home")])
+    rows.append([InlineKeyboardButton("‹  Back", callback_data="menu:home")])
     return InlineKeyboardMarkup(rows)
 
 
@@ -204,13 +313,13 @@ def days_menu() -> InlineKeyboardMarkup:
             buf = []
     if buf:
         rows.append(buf)
-    rows.append([InlineKeyboardButton("⬅️ Back", callback_data="menu:buy")])
+    rows.append([InlineKeyboardButton("‹  Back", callback_data="menu:buy")])
     return InlineKeyboardMarkup(rows)
 
 
 def end_chat_menu() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
-        [[InlineKeyboardButton("🔚 End chat / Main menu", callback_data="menu:home")]]
+        [[InlineKeyboardButton("‹  End chat / Main menu", callback_data="menu:home")]]
     )
 
 
@@ -229,8 +338,8 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if user.id == ADMIN_ID:
         return await admin_help(update, context)
     set_state(user.id, mode="idle", tool=None)
-    await update.effective_message.reply_text(
-        WELCOME, reply_markup=main_menu(), parse_mode=ParseMode.HTML
+    await send_html(
+        context.bot, user.id, welcome_text(), reply_markup=main_menu()
     )
 
 
@@ -242,38 +351,37 @@ async def on_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if action == "home":
         set_state(user.id, mode="idle", tool=None)
-        await q.edit_message_text(
-            WELCOME, reply_markup=main_menu(), parse_mode=ParseMode.HTML
-        )
+        await edit_html(q, welcome_text(), reply_markup=main_menu())
 
     elif action == "buy":
         set_state(user.id, mode="idle", tool=None)
-        await q.edit_message_text(
-            "🧰 <b>Which tool is the license for?</b>\n\nSelect from the list below:",
+        await edit_html(
+            q,
+            f"{e('rocket')} <b>Select Your Tool</b>\n\n"
+            f"{e('info')} Which product is this license for?",
             reply_markup=tools_menu(),
-            parse_mode=ParseMode.HTML,
         )
 
     elif action == "agent":
         set_state(user.id, mode="await_message")
-        await q.edit_message_text(
-            "💬 <b>Contact Live Agent</b>\n\n"
-            "Please type the message you'd like to send to our support team.\n"
-            "An agent will reply here shortly.",
-            parse_mode=ParseMode.HTML,
+        await edit_html(
+            q,
+            f"{e('user')} <b>Live Agent</b>\n\n"
+            "Type the message you'd like to send to our support team.\n"
+            f"{e('bolt')} An agent will reply right here.",
         )
 
 
 async def on_tool(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     await q.answer()
-    idx = int(q.data.split(":", 1)[1])
-    tool = TOOLS[idx]
+    tool = TOOLS[int(q.data.split(":", 1)[1])]
     set_state(q.from_user.id, tool=tool)
-    await q.edit_message_text(
-        f"🧰 Tool: <b>{tool}</b>\n\n⏳ <b>How many days should the license key cover?</b>",
+    await edit_html(
+        q,
+        f"{e('star')} Tool: <b>{tool}</b>\n\n"
+        f"{e('hourglass')} <b>Choose your license duration</b>",
         reply_markup=days_menu(),
-        parse_mode=ParseMode.HTML,
     )
 
 
@@ -282,67 +390,69 @@ async def on_days(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await q.answer()
     days = int(q.data.split(":", 1)[1])
     user = q.from_user
-    st = get_state(user.id)
-    tool = st.get("tool")
+    tool = get_state(user.id).get("tool")
 
     if not tool:
-        return await q.edit_message_text(
-            "Session expired. Please start again.", reply_markup=main_menu()
+        return await edit_html(
+            q,
+            f"{e('cross')} Session expired. Please start again.",
+            reply_markup=main_menu(),
         )
 
     ref = new_reference()
     save_ticket(ref, user, tool, days)
     set_state(user.id, mode="live", last_ref=ref)
 
-    await q.edit_message_text(
-        "✅ <b>Order reference generated</b>\n\n"
-        f"🔖 Reference: <code>{ref}</code>\n"
-        f"🧰 Tool: <b>{tool}</b>\n"
-        f"⏳ Duration: <b>{days} days</b>\n\n"
-        "🔄 <i>Connecting you to a live agent to complete payment…</i>\n\n"
-        "An agent will send you the payment details in this chat. "
+    await edit_html(
+        q,
+        f"{e('check')} <b>Order Reference Generated</b>\n\n"
+        f"{e('gem')} Reference: <code>{ref}</code>\n"
+        f"{e('star')} Tool: <b>{tool}</b>\n"
+        f"{e('hourglass')} Duration: <b>{days} days</b>\n\n"
+        f"{e('bolt')} <i>Connecting you to a live agent to complete payment…</i>\n\n"
+        f"{e('info')} Payment details will arrive in this chat. "
         "You can reply here at any time.",
-        parse_mode=ParseMode.HTML,
         reply_markup=end_chat_menu(),
     )
 
-    sent = await context.bot.send_message(
+    sent = await send_html(
+        context.bot,
         ADMIN_ID,
-        "🧾 <b>NEW LICENSE REQUEST</b>\n\n"
-        f"🔖 Ref: <code>{ref}</code>\n"
-        f"🧰 Tool: <b>{tool}</b>\n"
-        f"⏳ Duration: <b>{days} days</b>\n"
-        f"👤 User: {user_label(user)}\n\n"
-        "↩️ <i>Reply to this message to send payment details to the customer.</i>",
-        parse_mode=ParseMode.HTML,
+        f"{e('gem')} <b>NEW LICENSE REQUEST</b>\n\n"
+        f"{e('star')} Ref: <code>{ref}</code>\n"
+        f"{e('rocket')} Tool: <b>{tool}</b>\n"
+        f"{e('hourglass')} Duration: <b>{days} days</b>\n"
+        f"{e('user')} User: {user_label(user)}\n\n"
+        f"{e('info')} <i>Reply to this message to send payment details.</i>",
     )
     map_msg(sent.message_id, user.id)
 
 
 async def on_user_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Any non-command message from a normal user."""
     msg = update.effective_message
     user = update.effective_user
     st = get_state(user.id)
 
-    # Not in a conversation yet -> show the menu
     if st.get("mode") not in ("await_message", "live"):
-        return await msg.reply_text(
-            WELCOME, reply_markup=main_menu(), parse_mode=ParseMode.HTML
+        return await send_html(
+            context.bot, user.id, welcome_text(), reply_markup=main_menu()
         )
 
     first_contact = st.get("mode") == "await_message"
     set_state(user.id, mode="live")
 
-    header = await context.bot.send_message(
-        ADMIN_ID,
-        ("💬 <b>NEW SUPPORT MESSAGE</b>\n\n" if first_contact else "💬 <b>Message</b>\n\n")
-        + f"👤 {user_label(user)}"
-        + (f"\n🔖 Ref: <code>{st['last_ref']}</code>" if st.get("last_ref") else "")
-        + "\n\n↩️ <i>Reply to this message to answer.</i>",
-        parse_mode=ParseMode.HTML,
+    header = (
+        f"{e('sparkle')} <b>NEW SUPPORT MESSAGE</b>\n\n"
+        if first_contact
+        else f"{e('bolt')} <b>Message</b>\n\n"
     )
-    map_msg(header.message_id, user.id)
+    header += f"{e('user')} {user_label(user)}"
+    if st.get("last_ref"):
+        header += f"\n{e('gem')} Ref: <code>{st['last_ref']}</code>"
+    header += f"\n\n{e('info')} <i>Reply to this message to answer.</i>"
+
+    sent = await send_html(context.bot, ADMIN_ID, header)
+    map_msg(sent.message_id, user.id)
 
     copied = await context.bot.copy_message(
         chat_id=ADMIN_ID, from_chat_id=msg.chat_id, message_id=msg.message_id
@@ -350,9 +460,11 @@ async def on_user_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     map_msg(copied.message_id, user.id)
 
     if first_contact:
-        await msg.reply_text(
-            "✅ Your message has been sent to our support team.\n"
-            "An agent will reply here shortly.",
+        await send_html(
+            context.bot,
+            user.id,
+            f"{e('check')} Your message has been delivered to our support team.\n"
+            f"{e('hourglass')} An agent will reply here shortly.",
             reply_markup=end_chat_menu(),
         )
 
@@ -363,44 +475,62 @@ async def on_user_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def admin_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.effective_message.reply_text(
-        "🛠 <b>Admin console</b>\n\n"
-        "• Reply to any forwarded message to answer that customer.\n"
-        "• <code>/reply &lt;user_id&gt; &lt;text&gt;</code> — answer without replying.\n"
-        "• <code>/tickets</code> — last 10 license requests.\n"
-        "• <code>/close &lt;user_id&gt;</code> — end that customer's live chat.",
-        parse_mode=ParseMode.HTML,
+    await send_html(
+        context.bot,
+        ADMIN_ID,
+        f"{e('bolt')} <b>Admin Console</b>\n\n"
+        f"{e('user')} Reply to any forwarded message to answer that customer.\n"
+        f"{e('star')} <code>/reply &lt;user_id&gt; &lt;text&gt;</code> — answer directly\n"
+        f"{e('gem')} <code>/tickets</code> — last 10 license requests\n"
+        f"{e('cross')} <code>/close &lt;user_id&gt;</code> — end a live chat\n"
+        f"{e('sparkle')} <code>/emoji</code> — premium emoji status",
+    )
+
+
+async def cmd_emoji(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    state = "active" if PREMIUM_ENABLED else "disabled (unicode fallback)"
+    sample = "  ".join(e(k) for k in EMOJI)
+    await send_html(
+        context.bot,
+        ADMIN_ID,
+        f"{e('info')} Premium emoji: <b>{state}</b>\n\n{sample}",
     )
 
 
 async def admin_relay(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Admin replies to a forwarded message -> deliver to that customer."""
     msg = update.effective_message
     if not msg.reply_to_message:
-        return await msg.reply_text(
-            "↩️ Reply to a customer's message, or use /reply <user_id> <text>."
+        return await send_html(
+            context.bot,
+            ADMIN_ID,
+            f"{e('info')} Reply to a customer's message, or use "
+            "<code>/reply &lt;user_id&gt; &lt;text&gt;</code>.",
         )
 
     user_id = lookup_msg(msg.reply_to_message.message_id)
     if not user_id:
-        return await msg.reply_text(
-            "⚠️ I can't match that message to a customer. Use /reply <user_id> <text>."
+        return await send_html(
+            context.bot,
+            ADMIN_ID,
+            f"{e('cross')} Can't match that message to a customer. "
+            "Use <code>/reply &lt;user_id&gt; &lt;text&gt;</code>.",
         )
 
     try:
         if msg.text:
-            await context.bot.send_message(
-                user_id, f"👨‍💼 <b>Support Agent</b>\n\n{msg.text_html}",
-                parse_mode=ParseMode.HTML,
+            await send_html(
+                context.bot,
+                user_id,
+                f"{e('user')} <b>Support Agent</b>\n\n{msg.text_html}",
             )
         else:
             await context.bot.copy_message(
                 chat_id=user_id, from_chat_id=msg.chat_id, message_id=msg.message_id
             )
         set_state(user_id, mode="live")
-        await msg.reply_text("✅ Delivered.")
-    except Exception as e:  # user blocked the bot, etc.
-        await msg.reply_text(f"❌ Could not deliver: {e}")
+        await msg.reply_text(f"{plain('check')} Delivered.")
+    except Exception as exc:
+        await msg.reply_text(f"{plain('cross')} Could not deliver: {exc}")
 
 
 async def cmd_reply(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -413,13 +543,13 @@ async def cmd_reply(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return await msg.reply_text("First argument must be a numeric user id.")
     text = " ".join(context.args[1:])
     try:
-        await context.bot.send_message(
-            user_id, f"👨‍💼 <b>Support Agent</b>\n\n{text}", parse_mode=ParseMode.HTML
+        await send_html(
+            context.bot, user_id, f"{e('user')} <b>Support Agent</b>\n\n{text}"
         )
         set_state(user_id, mode="live")
-        await msg.reply_text("✅ Delivered.")
-    except Exception as e:
-        await msg.reply_text(f"❌ Could not deliver: {e}")
+        await msg.reply_text(f"{plain('check')} Delivered.")
+    except Exception as exc:
+        await msg.reply_text(f"{plain('cross')} Could not deliver: {exc}")
 
 
 async def cmd_tickets(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -428,16 +558,16 @@ async def cmd_tickets(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "SELECT * FROM tickets ORDER BY created_at DESC LIMIT 10"
         ).fetchall()
     if not rows:
-        return await update.effective_message.reply_text("No tickets yet.")
-    out = ["🧾 <b>Recent license requests</b>\n"]
+        return await send_html(
+            context.bot, ADMIN_ID, f"{e('info')} No tickets yet."
+        )
+    out = [f"{e('gem')} <b>Recent License Requests</b>\n"]
     for r in rows:
         out.append(
-            f"<code>{r['ref']}</code> — {r['tool']} / {r['days']}d — "
-            f"@{r['username']} (<code>{r['user_id']}</code>) — {r['status']}"
+            f"{e('star')} <code>{r['ref']}</code> — {r['tool']} / {r['days']}d\n"
+            f"     @{r['username']} (<code>{r['user_id']}</code>) · {r['status']}"
         )
-    await update.effective_message.reply_text(
-        "\n".join(out), parse_mode=ParseMode.HTML
-    )
+    await send_html(context.bot, ADMIN_ID, "\n".join(out))
 
 
 async def cmd_close(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -447,14 +577,16 @@ async def cmd_close(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = int(context.args[0])
     set_state(user_id, mode="idle", tool=None)
     try:
-        await context.bot.send_message(
+        await send_html(
+            context.bot,
             user_id,
-            "✅ This support session has been closed. Tap below if you need anything else.",
+            f"{e('check')} This support session has been closed.\n"
+            f"{e('sparkle')} Tap below if you need anything else.",
             reply_markup=main_menu(),
         )
     except Exception:
         pass
-    await msg.reply_text("Closed.")
+    await msg.reply_text(f"{plain('check')} Closed.")
 
 
 async def on_error(update: object, context: ContextTypes.DEFAULT_TYPE):
@@ -468,14 +600,18 @@ async def on_error(update: object, context: ContextTypes.DEFAULT_TYPE):
 
 def main():
     init_db()
-    app = Application.builder().token(BOT_TOKEN).build()
+    try:
+        asyncio.get_event_loop()
+    except RuntimeError:
+        asyncio.set_event_loop(asyncio.new_event_loop())
 
+    app = Application.builder().token(BOT_TOKEN).build()
     admin = filters.User(ADMIN_ID)
 
-    # Admin commands first
     app.add_handler(CommandHandler("reply", cmd_reply, filters=admin))
     app.add_handler(CommandHandler("tickets", cmd_tickets, filters=admin))
     app.add_handler(CommandHandler("close", cmd_close, filters=admin))
+    app.add_handler(CommandHandler("emoji", cmd_emoji, filters=admin))
     app.add_handler(CommandHandler("admin", admin_help, filters=admin))
 
     app.add_handler(CommandHandler(["start", "menu", "help"], start))
@@ -499,7 +635,7 @@ def main():
             drop_pending_updates=True,
         )
     else:
-        log.info("WEBHOOK_URL not set — falling back to polling (local dev)")
+        log.info("No webhook URL — polling mode (local dev)")
         app.run_polling(drop_pending_updates=True)
 
 
