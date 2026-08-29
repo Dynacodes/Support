@@ -1,9 +1,8 @@
 """
-FropTools Support Bot — v3
+FropTools Support Bot — v4
 --------------------------
-Adds: broadcast, typing indicators, rate limiting, out-of-hours auto-reply,
-ticket lifecycle (open/paid/delivered/closed/reopened) and admin inline
-action buttons on every ticket.
+Adds: duplicate-ticket guard, 24h idle auto-close, admin-managed tool list,
+and a self-pinger that keeps the Render service from spinning down.
 
 Env vars:
   BOT_TOKEN        - from @BotFather                              (required)
@@ -14,7 +13,11 @@ Env vars:
   CLOSE_HOUR       - support closes, WAT 24h clock (default 23)   (optional)
   RATE_MAX         - msgs allowed per window (default 6)          (optional)
   RATE_WINDOW      - window in seconds (default 20)               (optional)
+  IDLE_HOURS       - auto-close idle tickets after N h (default 24)
+  PING_MINUTES     - keep-alive interval (default 10, 0 disables)
   DB_PATH          - defaults to support.db                       (optional)
+
+Requires: python-telegram-bot[webhooks,job-queue]==21.6
 """
 
 import asyncio
@@ -28,6 +31,7 @@ import time
 from collections import defaultdict, deque
 from datetime import datetime, timedelta, timezone
 
+import httpx
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.constants import ChatAction, ParseMode
 from telegram.error import BadRequest, Forbidden
@@ -52,8 +56,6 @@ WEBHOOK_URL = os.environ.get(
 PORT = int(os.environ.get("PORT", "10000"))
 DB_PATH = os.environ.get("DB_PATH", "support.db")
 
-# Nigeria is UTC+1 year round (no DST), so a fixed offset is safer than
-# depending on system tzdata being present in the container.
 WAT = timezone(timedelta(hours=1), "WAT")
 OPEN_HOUR = int(os.environ.get("OPEN_HOUR", "9"))
 CLOSE_HOUR = int(os.environ.get("CLOSE_HOUR", "23"))
@@ -61,7 +63,10 @@ CLOSE_HOUR = int(os.environ.get("CLOSE_HOUR", "23"))
 RATE_MAX = int(os.environ.get("RATE_MAX", "6"))
 RATE_WINDOW = int(os.environ.get("RATE_WINDOW", "20"))
 
-TOOLS = [
+IDLE_HOURS = int(os.environ.get("IDLE_HOURS", "24"))
+PING_MINUTES = int(os.environ.get("PING_MINUTES", "10"))
+
+DEFAULT_TOOLS = [
     "FropLogger",
     "FropTrack",
     "FropPaypalFlash",
@@ -152,8 +157,28 @@ async def edit_html(query, text: str, **kwargs):
         )
 
 
+async def edit_html_msg(bot, chat_id: int, message_id: int, text: str, **kwargs):
+    """Edit a message we sent earlier (used by the auto-close job)."""
+    global PREMIUM_ENABLED
+    try:
+        return await bot.edit_message_text(
+            text, chat_id=chat_id, message_id=message_id,
+            parse_mode=ParseMode.HTML, **kwargs
+        )
+    except BadRequest as exc:
+        msg = str(exc).lower()
+        if "not modified" in msg or "message to edit not found" in msg:
+            return
+        if "custom emoji" not in msg:
+            raise
+        PREMIUM_ENABLED = False
+        return await bot.edit_message_text(
+            degrade(text), chat_id=chat_id, message_id=message_id,
+            parse_mode=ParseMode.HTML, **kwargs
+        )
+
+
 async def typing(bot, chat_id: int, seconds: float = 0.6):
-    """Show a typing indicator so relayed replies feel live."""
     try:
         await bot.send_chat_action(chat_id, ChatAction.TYPING)
         await asyncio.sleep(seconds)
@@ -183,11 +208,8 @@ def hours_label() -> str:
 
 
 def offline_notice() -> str:
-    now = now_wat()
-    if now.hour < OPEN_HOUR:
-        when = f"today at {OPEN_HOUR}:00"
-    else:
-        when = f"tomorrow at {OPEN_HOUR}:00"
+    when = f"today at {OPEN_HOUR}:00" if now_wat().hour < OPEN_HOUR \
+        else f"tomorrow at {OPEN_HOUR}:00"
     return (
         f"{e('hourglass')} <b>Our agents are offline right now.</b>\n"
         f"{e('info')} Support hours: <b>{hours_label()}</b>\n\n"
@@ -196,7 +218,7 @@ def offline_notice() -> str:
 
 
 # ----------------------------------------------------------------------------
-# Rate limiting (in-memory sliding window, per user)
+# Rate limiting
 # ----------------------------------------------------------------------------
 
 _hits: dict[int, deque] = defaultdict(deque)
@@ -215,7 +237,6 @@ def rate_ok(user_id: int) -> bool:
 
 
 def should_warn(user_id: int) -> bool:
-    """Warn at most once per window so the limiter can't be used to spam back."""
     now = time.time()
     if now - _warned.get(user_id, 0) < RATE_WINDOW:
         return False
@@ -264,16 +285,78 @@ def init_db():
                 first_seen TEXT,
                 active     INTEGER DEFAULT 1
             );
+            CREATE TABLE IF NOT EXISTS tools (
+                id       INTEGER PRIMARY KEY AUTOINCREMENT,
+                name     TEXT UNIQUE NOT NULL,
+                active   INTEGER DEFAULT 1,
+                position INTEGER DEFAULT 0
+            );
             """
         )
-        # migrations for databases created by v1/v2
         cols = {r["name"] for r in conn.execute("PRAGMA table_info(tickets)")}
         if "kind" not in cols:
-            conn.execute(
-                "ALTER TABLE tickets ADD COLUMN kind TEXT DEFAULT 'license'"
-            )
+            conn.execute("ALTER TABLE tickets ADD COLUMN kind TEXT DEFAULT 'license'")
         if "admin_msg_id" not in cols:
             conn.execute("ALTER TABLE tickets ADD COLUMN admin_msg_id INTEGER")
+        if "last_activity" not in cols:
+            conn.execute("ALTER TABLE tickets ADD COLUMN last_activity TEXT")
+            conn.execute(
+                "UPDATE tickets SET last_activity = created_at "
+                "WHERE last_activity IS NULL"
+            )
+        # seed the tool list on first run
+        if not conn.execute("SELECT 1 FROM tools LIMIT 1").fetchone():
+            conn.executemany(
+                "INSERT INTO tools (name, position) VALUES (?,?)",
+                [(n, i) for i, n in enumerate(DEFAULT_TOOLS)],
+            )
+
+
+# --- tools -----------------------------------------------------------------
+
+
+def list_tools(active_only=True):
+    q = "SELECT * FROM tools"
+    if active_only:
+        q += " WHERE active = 1"
+    q += " ORDER BY position, id"
+    with db() as conn:
+        return conn.execute(q).fetchall()
+
+
+def tool_by_id(tool_id: int):
+    with db() as conn:
+        return conn.execute(
+            "SELECT * FROM tools WHERE id = ?", (tool_id,)
+        ).fetchone()
+
+
+def add_tool(name: str) -> bool:
+    with db() as conn:
+        row = conn.execute(
+            "SELECT id, active FROM tools WHERE name = ?", (name,)
+        ).fetchone()
+        if row:
+            if row["active"]:
+                return False
+            conn.execute("UPDATE tools SET active = 1 WHERE id = ?", (row["id"],))
+            return True
+        pos = conn.execute(
+            "SELECT COALESCE(MAX(position), 0) + 1 p FROM tools"
+        ).fetchone()["p"]
+        conn.execute(
+            "INSERT INTO tools (name, position) VALUES (?,?)", (name, pos)
+        )
+    return True
+
+
+def remove_tool(tool_id: int):
+    """Soft delete, so historic tickets keep a readable tool name."""
+    with db() as conn:
+        conn.execute("UPDATE tools SET active = 0 WHERE id = ?", (tool_id,))
+
+
+# --- users -----------------------------------------------------------------
 
 
 def remember_user(user):
@@ -282,12 +365,8 @@ def remember_user(user):
             "INSERT INTO users (user_id, username, full_name, first_seen, active) "
             "VALUES (?,?,?,?,1) ON CONFLICT(user_id) DO UPDATE SET "
             "username=excluded.username, full_name=excluded.full_name, active=1",
-            (
-                user.id,
-                user.username,
-                user.full_name,
-                now_wat().isoformat(timespec="seconds"),
-            ),
+            (user.id, user.username, user.full_name,
+             now_wat().isoformat(timespec="seconds")),
         )
 
 
@@ -303,6 +382,9 @@ def all_active_users() -> list[int]:
             (ADMIN_ID,),
         ).fetchall()
     return [r["user_id"] for r in rows]
+
+
+# --- state -----------------------------------------------------------------
 
 
 def get_state(user_id: int) -> dict:
@@ -343,15 +425,14 @@ def lookup_msg(admin_msg_id: int):
     return row["user_id"] if row else None
 
 
+# --- tickets ---------------------------------------------------------------
+
+
 def new_reference() -> str:
     alphabet = string.ascii_uppercase + string.digits
     while True:
-        ref = (
-            "FT-"
-            + "".join(secrets.choice(alphabet) for _ in range(4))
-            + "-"
-            + "".join(secrets.choice(alphabet) for _ in range(4))
-        )
+        ref = ("FT-" + "".join(secrets.choice(alphabet) for _ in range(4))
+               + "-" + "".join(secrets.choice(alphabet) for _ in range(4)))
         with db() as conn:
             if not conn.execute(
                 "SELECT 1 FROM tickets WHERE ref = ?", (ref,)
@@ -361,42 +442,43 @@ def new_reference() -> str:
 
 def create_ticket(user, kind, tool=None, days=None) -> str:
     ref = new_reference()
+    stamp = now_wat().isoformat(timespec="seconds")
     with db() as conn:
         conn.execute(
             "INSERT INTO tickets (ref, user_id, username, tool, days, status, "
-            "created_at, kind) VALUES (?,?,?,?,?,?,?,?)",
-            (
-                ref,
-                user.id,
-                user.username or user.full_name,
-                tool,
-                days,
-                "awaiting_payment" if kind == "license" else "open",
-                now_wat().isoformat(timespec="seconds"),
-                kind,
-            ),
+            "created_at, kind, last_activity) VALUES (?,?,?,?,?,?,?,?,?)",
+            (ref, user.id, user.username or user.full_name, tool, days,
+             "awaiting_payment" if kind == "license" else "open",
+             stamp, kind, stamp),
         )
     return ref
 
 
 def get_ticket(ref: str):
     with db() as conn:
-        return conn.execute(
-            "SELECT * FROM tickets WHERE ref = ?", (ref,)
-        ).fetchone()
+        return conn.execute("SELECT * FROM tickets WHERE ref = ?", (ref,)).fetchone()
 
 
 def set_ticket_status(ref: str, status: str):
     with db() as conn:
-        conn.execute(
-            "UPDATE tickets SET status = ? WHERE ref = ?", (status, ref)
-        )
+        conn.execute("UPDATE tickets SET status = ? WHERE ref = ?", (status, ref))
 
 
 def set_ticket_admin_msg(ref: str, msg_id: int):
     with db() as conn:
         conn.execute(
             "UPDATE tickets SET admin_msg_id = ? WHERE ref = ?", (msg_id, ref)
+        )
+
+
+def touch_ticket(ref: str):
+    """Reset the idle clock — called on every message either way."""
+    if not ref:
+        return
+    with db() as conn:
+        conn.execute(
+            "UPDATE tickets SET last_activity = ? WHERE ref = ?",
+            (now_wat().isoformat(timespec="seconds"), ref),
         )
 
 
@@ -409,6 +491,15 @@ def open_ticket_for(user_id: int):
         ).fetchone()
 
 
+def stale_tickets(hours: int):
+    cutoff = (now_wat() - timedelta(hours=hours)).isoformat(timespec="seconds")
+    with db() as conn:
+        return conn.execute(
+            "SELECT * FROM tickets WHERE status != 'closed' AND last_activity < ?",
+            (cutoff,),
+        ).fetchall()
+
+
 # ----------------------------------------------------------------------------
 # Copy & keyboards
 # ----------------------------------------------------------------------------
@@ -416,8 +507,7 @@ def open_ticket_for(user_id: int):
 
 def welcome_text() -> str:
     status = (
-        f"{e('bolt')} <i>Agents online now</i>"
-        if within_hours()
+        f"{e('bolt')} <i>Agents online now</i>" if within_hours()
         else f"{e('hourglass')} <i>Agents offline · back at {OPEN_HOUR}:00 WAT</i>"
     )
     return (
@@ -429,22 +519,22 @@ def welcome_text() -> str:
 
 
 def main_menu() -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup(
-        [
-            [InlineKeyboardButton(
-                f"{plain('gem')}  Buy License Key", callback_data="menu:buy"
-            )],
-            [InlineKeyboardButton(
-                f"{plain('user')}  Contact Live Agent", callback_data="menu:agent"
-            )],
-        ]
-    )
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton(
+            f"{plain('gem')}  Buy License Key", callback_data="menu:buy"
+        )],
+        [InlineKeyboardButton(
+            f"{plain('user')}  Contact Live Agent", callback_data="menu:agent"
+        )],
+    ])
 
 
 def tools_menu() -> InlineKeyboardMarkup:
     rows = [
-        [InlineKeyboardButton(f"{plain('star')}  {name}", callback_data=f"tool:{i}")]
-        for i, name in enumerate(TOOLS)
+        [InlineKeyboardButton(
+            f"{plain('star')}  {t['name']}", callback_data=f"tool:{t['id']}"
+        )]
+        for t in list_tools()
     ]
     rows.append([InlineKeyboardButton("‹  Back", callback_data="menu:home")])
     return InlineKeyboardMarkup(rows)
@@ -469,6 +559,17 @@ def end_chat_menu() -> InlineKeyboardMarkup:
     )
 
 
+def duplicate_menu() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton(
+            f"{plain('bolt')}  Continue existing ticket", callback_data="menu:resume"
+        )],
+        [InlineKeyboardButton(
+            f"{plain('cross')}  Close it & start over", callback_data="menu:reset"
+        )],
+    ])
+
+
 def user_label(user) -> str:
     handle = f"@{user.username}" if user.username else "no username"
     return f"{user.full_name} ({handle}) — <code>{user.id}</code>"
@@ -484,7 +585,6 @@ STATUS_LABEL = {
 
 
 def ticket_keyboard(ref: str, status: str, kind: str) -> InlineKeyboardMarkup:
-    """Admin actions available for a ticket in its current status."""
     rows = []
     if status == "closed":
         rows.append([InlineKeyboardButton(
@@ -517,10 +617,8 @@ def ticket_admin_text(row) -> str:
     status = STATUS_LABEL.get(row["status"], row["status"])
     if row["kind"] == "license":
         head = f"{e('gem')} <b>LICENSE REQUEST</b>"
-        body = (
-            f"{e('rocket')} Tool: <b>{row['tool']}</b>\n"
-            f"{e('hourglass')} Duration: <b>{row['days']} days</b>\n"
-        )
+        body = (f"{e('rocket')} Tool: <b>{row['tool']}</b>\n"
+                f"{e('hourglass')} Duration: <b>{row['days']} days</b>\n")
     else:
         head = f"{e('sparkle')} <b>SUPPORT TICKET</b>"
         body = ""
@@ -531,6 +629,20 @@ def ticket_admin_text(row) -> str:
         f"{e('user')} User: @{row['username']} — <code>{row['user_id']}</code>\n"
         f"{e('info')} Status: <b>{status}</b>\n\n"
         f"<i>Reply to this message to talk to the customer.</i>"
+    )
+
+
+def duplicate_notice(row) -> str:
+    detail = (f"{row['tool']} · {row['days']} days"
+              if row["kind"] == "license" else "support request")
+    return (
+        f"{e('info')} <b>You already have an open ticket</b>\n\n"
+        f"{e('gem')} Ref: <code>{row['ref']}</code>\n"
+        f"{e('star')} {detail}\n"
+        f"{e('hourglass')} Status: <b>"
+        f"{STATUS_LABEL.get(row['status'], row['status'])}</b>\n\n"
+        "Please finish this one before opening another — "
+        "it keeps your conversation with our agent in one place."
     )
 
 
@@ -557,10 +669,51 @@ async def on_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if action == "home":
         set_state(user.id, mode="idle", tool=None)
-        await edit_html(q, welcome_text(), reply_markup=main_menu())
+        return await edit_html(q, welcome_text(), reply_markup=main_menu())
 
-    elif action == "buy":
+    if action == "resume":
+        row = open_ticket_for(user.id)
+        if not row:
+            set_state(user.id, mode="idle", tool=None, last_ref=None)
+            return await edit_html(q, welcome_text(), reply_markup=main_menu())
+        set_state(user.id, mode="live", last_ref=row["ref"])
+        touch_ticket(row["ref"])
+        return await edit_html(
+            q,
+            f"{e('bolt')} <b>You're back on ticket "
+            f"<code>{row['ref']}</code></b>\n\n"
+            "Send your message and our agent will see it.",
+            reply_markup=end_chat_menu(),
+        )
+
+    if action == "reset":
+        row = open_ticket_for(user.id)
+        if row:
+            set_ticket_status(row["ref"], "closed")
+            await _sync_admin_ticket(context.bot, row["ref"])
+            await send_html(
+                context.bot, ADMIN_ID,
+                f"{e('info')} <code>{row['ref']}</code> was closed by the customer.",
+            )
+        set_state(user.id, mode="idle", tool=None, last_ref=None)
+        return await edit_html(q, welcome_text(), reply_markup=main_menu())
+
+    # --- duplicate guard: one live ticket per user --------------------------
+    existing = open_ticket_for(user.id)
+    if existing and action in ("buy", "agent"):
+        return await edit_html(
+            q, duplicate_notice(existing), reply_markup=duplicate_menu()
+        )
+
+    if action == "buy":
         set_state(user.id, mode="idle", tool=None)
+        if not list_tools():
+            return await edit_html(
+                q,
+                f"{e('cross')} No tools are listed right now. "
+                "Please contact a live agent.",
+                reply_markup=main_menu(),
+            )
         await edit_html(
             q,
             f"{e('rocket')} <b>Select Your Tool</b>\n\n"
@@ -570,26 +723,27 @@ async def on_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     elif action == "agent":
         set_state(user.id, mode="await_message")
-        text = (
-            f"{e('user')} <b>Live Agent</b>\n\n"
-            "Type the message you'd like to send to our support team.\n"
-        )
-        text += (
-            f"{e('bolt')} An agent will reply right here."
-            if within_hours()
-            else f"\n{offline_notice()}"
-        )
+        text = (f"{e('user')} <b>Live Agent</b>\n\n"
+                "Type the message you'd like to send to our support team.\n")
+        text += (f"{e('bolt')} An agent will reply right here."
+                 if within_hours() else f"\n{offline_notice()}")
         await edit_html(q, text)
 
 
 async def on_tool(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     await q.answer()
-    tool = TOOLS[int(q.data.split(":", 1)[1])]
-    set_state(q.from_user.id, tool=tool)
+    row = tool_by_id(int(q.data.split(":", 1)[1]))
+    if not row:
+        return await edit_html(
+            q,
+            f"{e('cross')} That tool is no longer available.",
+            reply_markup=tools_menu(),
+        )
+    set_state(q.from_user.id, tool=row["name"])
     await edit_html(
         q,
-        f"{e('star')} Tool: <b>{tool}</b>\n\n"
+        f"{e('star')} Tool: <b>{row['name']}</b>\n\n"
         f"{e('hourglass')} <b>Choose your license duration</b>",
         reply_markup=days_menu(),
     )
@@ -600,12 +754,17 @@ async def on_days(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await q.answer()
     days = int(q.data.split(":", 1)[1])
     user = q.from_user
-    tool = get_state(user.id).get("tool")
 
+    existing = open_ticket_for(user.id)
+    if existing:
+        return await edit_html(
+            q, duplicate_notice(existing), reply_markup=duplicate_menu()
+        )
+
+    tool = get_state(user.id).get("tool")
     if not tool:
         return await edit_html(
-            q,
-            f"{e('cross')} Session expired. Please start again.",
+            q, f"{e('cross')} Session expired. Please start again.",
             reply_markup=main_menu(),
         )
 
@@ -618,22 +777,17 @@ async def on_days(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"{e('star')} Tool: <b>{tool}</b>\n"
         f"{e('hourglass')} Duration: <b>{days} days</b>\n\n"
     )
-    if within_hours():
-        text += (
-            f"{e('bolt')} <i>Connecting you to a live agent to complete payment…</i>"
-            f"\n\n{e('info')} Payment details will arrive in this chat."
-        )
-    else:
-        text += offline_notice()
-
+    text += (
+        f"{e('bolt')} <i>Connecting you to a live agent to complete payment…</i>"
+        f"\n\n{e('info')} Payment details will arrive in this chat."
+        if within_hours() else offline_notice()
+    )
     await edit_html(q, text, reply_markup=end_chat_menu())
 
     await typing(context.bot, ADMIN_ID)
     row = get_ticket(ref)
     sent = await send_html(
-        context.bot,
-        ADMIN_ID,
-        ticket_admin_text(row),
+        context.bot, ADMIN_ID, ticket_admin_text(row),
         reply_markup=ticket_keyboard(ref, row["status"], row["kind"]),
     )
     map_msg(sent.message_id, user.id)
@@ -654,8 +808,7 @@ async def on_user_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not rate_ok(user.id):
         if should_warn(user.id):
             await send_html(
-                context.bot,
-                user.id,
+                context.bot, user.id,
                 f"{e('hourglass')} You're sending messages too quickly.\n"
                 f"{e('info')} Please wait about {RATE_WINDOW} seconds — "
                 "your earlier messages have already reached our team.",
@@ -667,25 +820,21 @@ async def on_user_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if first_contact and not ref:
         ref = create_ticket(user, "support")
-        set_state(user.id, mode="live", last_ref=ref)
-    else:
-        set_state(user.id, mode="live")
+    set_state(user.id, mode="live", last_ref=ref)
+    touch_ticket(ref)
 
     await typing(context.bot, ADMIN_ID)
 
     if first_contact:
         row = get_ticket(ref)
         header = await send_html(
-            context.bot,
-            ADMIN_ID,
-            ticket_admin_text(row),
+            context.bot, ADMIN_ID, ticket_admin_text(row),
             reply_markup=ticket_keyboard(ref, row["status"], row["kind"]),
         )
         set_ticket_admin_msg(ref, header.message_id)
     else:
         header = await send_html(
-            context.bot,
-            ADMIN_ID,
+            context.bot, ADMIN_ID,
             f"{e('bolt')} <b>Message</b> · <code>{ref}</code>\n"
             f"{e('user')} {user_label(user)}",
         )
@@ -697,23 +846,32 @@ async def on_user_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     map_msg(copied.message_id, user.id)
 
     if first_contact:
-        ack = (
-            f"{e('check')} Your message has been delivered to our support team.\n"
-            f"{e('gem')} Ticket: <code>{ref}</code>\n"
-        )
-        ack += (
-            f"{e('hourglass')} An agent will reply here shortly."
-            if within_hours()
-            else f"\n{offline_notice()}"
-        )
+        ack = (f"{e('check')} Your message has been delivered to our support team.\n"
+               f"{e('gem')} Ticket: <code>{ref}</code>\n")
+        ack += (f"{e('hourglass')} An agent will reply here shortly."
+                if within_hours() else f"\n{offline_notice()}")
         await send_html(context.bot, user.id, ack, reply_markup=end_chat_menu())
     elif not within_hours():
         await send_html(context.bot, user.id, offline_notice())
 
 
 # ----------------------------------------------------------------------------
-# Ticket action buttons (admin)
+# Ticket actions
 # ----------------------------------------------------------------------------
+
+
+async def _sync_admin_ticket(bot, ref: str):
+    """Refresh the admin-side ticket card after a status change."""
+    row = get_ticket(ref)
+    if not row or not row["admin_msg_id"]:
+        return
+    try:
+        await edit_html_msg(
+            bot, ADMIN_ID, row["admin_msg_id"], ticket_admin_text(row),
+            reply_markup=ticket_keyboard(ref, row["status"], row["kind"]),
+        )
+    except Exception as exc:
+        log.debug("Could not sync ticket card %s: %s", ref, exc)
 
 
 async def on_ticket_action(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -734,40 +892,29 @@ async def on_ticket_action(update: Update, context: ContextTypes.DEFAULT_TYPE):
     }[action]
 
     set_ticket_status(ref, new_status)
+    touch_ticket(ref)
     await q.answer(f"Ticket {ref} → {new_status}")
 
     updated = get_ticket(ref)
     await edit_html(
-        q,
-        ticket_admin_text(updated),
+        q, ticket_admin_text(updated),
         reply_markup=ticket_keyboard(ref, new_status, updated["kind"]),
     )
 
     notices = {
-        "paid": (
-            f"{e('check')} <b>Payment confirmed</b>\n\n"
-            f"{e('gem')} Ref: <code>{ref}</code>\n"
-            f"{e('hourglass')} Your license is being prepared — hold tight."
-        ),
-        "delivered": (
-            f"{e('gem')} <b>License delivered</b>\n\n"
-            f"{e('star')} Ref: <code>{ref}</code>\n"
-            f"{e('sparkle')} Thank you for choosing Froptools!"
-        ),
-        "closed": (
-            f"{e('check')} <b>Ticket closed</b>\n\n"
-            f"{e('info')} Ref <code>{ref}</code> has been resolved. "
-            "Tap below if you need anything else."
-        ),
-        "open": (
-            f"{e('bolt')} <b>Ticket reopened</b>\n\n"
-            f"{e('info')} Ref <code>{ref}</code> is active again — "
-            "an agent is with you."
-        ),
-        "awaiting_payment": (
-            f"{e('bolt')} <b>Ticket reopened</b>\n\n"
-            f"{e('info')} Ref <code>{ref}</code> is active again."
-        ),
+        "paid": (f"{e('check')} <b>Payment confirmed</b>\n\n"
+                 f"{e('gem')} Ref: <code>{ref}</code>\n"
+                 f"{e('hourglass')} Your license is being prepared — hold tight."),
+        "delivered": (f"{e('gem')} <b>License delivered</b>\n\n"
+                      f"{e('star')} Ref: <code>{ref}</code>\n"
+                      f"{e('sparkle')} Thank you for choosing Froptools!"),
+        "closed": (f"{e('check')} <b>Ticket closed</b>\n\n"
+                   f"{e('info')} Ref <code>{ref}</code> has been resolved. "
+                   "Tap below if you need anything else."),
+        "open": (f"{e('bolt')} <b>Ticket reopened</b>\n\n"
+                 f"{e('info')} Ref <code>{ref}</code> is active again."),
+        "awaiting_payment": (f"{e('bolt')} <b>Ticket reopened</b>\n\n"
+                             f"{e('info')} Ref <code>{ref}</code> is active again."),
     }
 
     user_id = row["user_id"]
@@ -788,24 +935,145 @@ async def on_ticket_action(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 # ----------------------------------------------------------------------------
+# Tool manager (admin)
+# ----------------------------------------------------------------------------
+
+
+def tool_panel_text() -> str:
+    rows = list_tools()
+    if not rows:
+        body = f"{e('cross')} <i>No active tools — customers can't buy.</i>"
+    else:
+        body = "\n".join(f"{e('star')} {r['name']}" for r in rows)
+    return (
+        f"{e('rocket')} <b>Tool Manager</b>\n\n{body}\n\n"
+        f"{e('info')} Tap a name to remove it, or add a new one below."
+    )
+
+
+def tool_panel_keyboard() -> InlineKeyboardMarkup:
+    rows = [
+        [InlineKeyboardButton(
+            f"{plain('cross')}  {r['name']}", callback_data=f"tl:del:{r['id']}"
+        )]
+        for r in list_tools()
+    ]
+    rows.append([InlineKeyboardButton("➕  Add tool", callback_data="tl:add")])
+    return InlineKeyboardMarkup(rows)
+
+
+async def cmd_tools(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await send_html(
+        context.bot, ADMIN_ID, tool_panel_text(),
+        reply_markup=tool_panel_keyboard(),
+    )
+
+
+async def on_tool_admin(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    if q.from_user.id != ADMIN_ID:
+        return await q.answer("Not authorised.", show_alert=True)
+
+    parts = q.data.split(":")
+    action = parts[1]
+
+    if action == "add":
+        context.bot_data["awaiting_tool"] = True
+        await q.answer()
+        return await edit_html(
+            q,
+            f"{e('rocket')} <b>Add a tool</b>\n\n"
+            f"{e('info')} Send the tool name as your next message.\n"
+            "Send <code>/cancel</code> to abort.",
+        )
+
+    if action == "del":
+        row = tool_by_id(int(parts[2]))
+        if row:
+            remove_tool(row["id"])
+            await q.answer(f"Removed {row['name']}")
+        await edit_html(
+            q, tool_panel_text(), reply_markup=tool_panel_keyboard()
+        )
+
+
+async def cmd_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    context.bot_data.pop("awaiting_tool", None)
+    await update.effective_message.reply_text(f"{plain('check')} Cancelled.")
+
+
+# ----------------------------------------------------------------------------
+# Scheduled jobs
+# ----------------------------------------------------------------------------
+
+
+async def job_autoclose(context: ContextTypes.DEFAULT_TYPE):
+    """Close tickets with no activity for IDLE_HOURS."""
+    rows = stale_tickets(IDLE_HOURS)
+    if not rows:
+        return
+    for row in rows:
+        ref, user_id = row["ref"], row["user_id"]
+        set_ticket_status(ref, "closed")
+        set_state(user_id, mode="idle", tool=None, last_ref=None)
+        await _sync_admin_ticket(context.bot, ref)
+        try:
+            await send_html(
+                context.bot, user_id,
+                f"{e('hourglass')} <b>Ticket auto-closed</b>\n\n"
+                f"{e('info')} <code>{ref}</code> was inactive for "
+                f"{IDLE_HOURS} hours, so we've closed it.\n"
+                f"{e('sparkle')} Start again any time — we're here.",
+                reply_markup=main_menu(),
+            )
+        except Forbidden:
+            deactivate_user(user_id)
+        except Exception as exc:
+            log.debug("Auto-close notice failed for %s: %s", user_id, exc)
+        await asyncio.sleep(0.05)
+
+    log.info("Auto-closed %d idle ticket(s)", len(rows))
+    await send_html(
+        context.bot, ADMIN_ID,
+        f"{e('hourglass')} Auto-closed <b>{len(rows)}</b> ticket(s) "
+        f"idle for over {IDLE_HOURS}h.",
+    )
+
+
+async def job_keepalive(context: ContextTypes.DEFAULT_TYPE):
+    """
+    Ping our own public URL so Render's free tier doesn't spin the service down.
+    Any HTTP status counts as traffic — a 404 on / is fine.
+    """
+    if not WEBHOOK_URL:
+        return
+    try:
+        async with httpx.AsyncClient(timeout=15) as client:
+            r = await client.get(f"{WEBHOOK_URL}/", follow_redirects=True)
+        log.info("Keep-alive ping → %s", r.status_code)
+    except Exception as exc:
+        log.warning("Keep-alive ping failed: %s", exc)
+
+
+# ----------------------------------------------------------------------------
 # Admin handlers
 # ----------------------------------------------------------------------------
 
 
 async def admin_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await send_html(
-        context.bot,
-        ADMIN_ID,
+        context.bot, ADMIN_ID,
         f"{e('bolt')} <b>Admin Console</b>\n\n"
         f"{e('user')} Reply to any message to answer that customer\n"
         f"{e('star')} <code>/reply &lt;user_id&gt; &lt;text&gt;</code> — direct reply\n"
         f"{e('gem')} <code>/tickets</code> — recent tickets\n"
         f"{e('hourglass')} <code>/open</code> — tickets still open\n"
-        f"{e('rocket')} <code>/broadcast &lt;text&gt;</code> — message all users\n"
+        f"{e('rocket')} <code>/tools</code> — add or remove tools\n"
+        f"{e('sparkle')} <code>/broadcast &lt;text&gt;</code> — message all users\n"
         f"{e('cross')} <code>/close &lt;user_id&gt;</code> — close their ticket\n"
-        f"{e('sparkle')} <code>/emoji</code> — premium emoji status\n"
-        f"{e('globe')} <code>/status</code> — hours, users, live chats\n\n"
-        f"{e('info')} Support hours: <b>{hours_label()}</b>",
+        f"{e('globe')} <code>/status</code> — hours, users, jobs\n"
+        f"{e('info')} <code>/emoji</code> — premium emoji status\n\n"
+        f"Hours: <b>{hours_label()}</b> · auto-close after <b>{IDLE_HOURS}h</b> idle",
     )
 
 
@@ -820,16 +1088,19 @@ async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
         open_t = conn.execute(
             "SELECT COUNT(*) c FROM tickets WHERE status != 'closed'"
         ).fetchone()["c"]
+    ping = f"every {PING_MINUTES} min" if PING_MINUTES else "disabled"
     await send_html(
-        context.bot,
-        ADMIN_ID,
+        context.bot, ADMIN_ID,
         f"{e('globe')} <b>Status</b>\n\n"
         f"{e('bolt')} Now: <b>{now_wat().strftime('%H:%M')} WAT</b> — "
         f"{'open' if within_hours() else 'closed'}\n"
         f"{e('info')} Hours: {hours_label()}\n"
         f"{e('user')} Reachable users: <b>{users}</b>\n"
         f"{e('sparkle')} Live chats: <b>{live}</b>\n"
-        f"{e('hourglass')} Open tickets: <b>{open_t}</b>",
+        f"{e('hourglass')} Open tickets: <b>{open_t}</b>\n"
+        f"{e('star')} Active tools: <b>{len(list_tools())}</b>\n"
+        f"{e('rocket')} Keep-alive: <b>{ping}</b>\n"
+        f"{e('gem')} Auto-close: <b>{IDLE_HOURS}h idle</b>",
     )
 
 
@@ -850,17 +1121,12 @@ async def cmd_broadcast(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.bot_data["broadcast"] = text
     recipients = len(all_active_users())
     await send_html(
-        context.bot,
-        ADMIN_ID,
+        context.bot, ADMIN_ID,
         f"{e('rocket')} <b>Broadcast preview</b> → {recipients} users\n"
         f"{'─' * 24}\n\n{text}",
         reply_markup=InlineKeyboardMarkup([[
-            InlineKeyboardButton(
-                f"{plain('check')} Send", callback_data="bc:send"
-            ),
-            InlineKeyboardButton(
-                f"{plain('cross')} Cancel", callback_data="bc:cancel"
-            ),
+            InlineKeyboardButton(f"{plain('check')} Send", callback_data="bc:send"),
+            InlineKeyboardButton(f"{plain('cross')} Cancel", callback_data="bc:cancel"),
         ]]),
     )
 
@@ -890,12 +1156,11 @@ async def on_broadcast_action(update: Update, context: ContextTypes.DEFAULT_TYPE
             blocked += 1
         except Exception:
             failed += 1
-        await asyncio.sleep(0.06)  # stay under Telegram's ~30 msg/s ceiling
+        await asyncio.sleep(0.06)
 
     context.bot_data.pop("broadcast", None)
     await send_html(
-        context.bot,
-        ADMIN_ID,
+        context.bot, ADMIN_ID,
         f"{e('check')} <b>Broadcast complete</b>\n\n"
         f"{e('rocket')} Delivered: <b>{sent}</b>\n"
         f"{e('cross')} Blocked the bot: <b>{blocked}</b>\n"
@@ -905,6 +1170,25 @@ async def on_broadcast_action(update: Update, context: ContextTypes.DEFAULT_TYPE
 
 async def admin_relay(update: Update, context: ContextTypes.DEFAULT_TYPE):
     msg = update.effective_message
+
+    # tool manager is waiting for a name
+    if context.bot_data.get("awaiting_tool"):
+        context.bot_data.pop("awaiting_tool", None)
+        name = (msg.text or "").strip()
+        if not name or len(name) > 40:
+            return await msg.reply_text(
+                f"{plain('cross')} Send a plain tool name under 40 characters."
+            )
+        ok = add_tool(name)
+        await msg.reply_text(
+            f"{plain('check')} Added “{name}”." if ok
+            else f"{plain('info')} “{name}” is already on the list."
+        )
+        return await send_html(
+            context.bot, ADMIN_ID, tool_panel_text(),
+            reply_markup=tool_panel_keyboard(),
+        )
+
     if not msg.reply_to_message:
         return await send_html(
             context.bot, ADMIN_ID,
@@ -932,7 +1216,9 @@ async def admin_relay(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 chat_id=user_id, from_chat_id=msg.chat_id, message_id=msg.message_id
             )
         row = open_ticket_for(user_id)
-        set_state(user_id, mode="live", last_ref=row["ref"] if row else None)
+        ref = row["ref"] if row else None
+        set_state(user_id, mode="live", last_ref=ref)
+        touch_ticket(ref)
         await msg.reply_text(f"{plain('check')} Delivered.")
     except Forbidden:
         deactivate_user(user_id)
@@ -955,7 +1241,10 @@ async def cmd_reply(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await send_html(
             context.bot, user_id, f"{e('user')} <b>Support Agent</b>\n\n{text}"
         )
-        set_state(user_id, mode="live")
+        row = open_ticket_for(user_id)
+        set_state(user_id, mode="live", last_ref=row["ref"] if row else None)
+        if row:
+            touch_ticket(row["ref"])
         await msg.reply_text(f"{plain('check')} Delivered.")
     except Forbidden:
         deactivate_user(user_id)
@@ -1003,6 +1292,7 @@ async def cmd_close(update: Update, context: ContextTypes.DEFAULT_TYPE):
     row = open_ticket_for(user_id)
     if row:
         set_ticket_status(row["ref"], "closed")
+        await _sync_admin_ticket(context.bot, row["ref"])
     set_state(user_id, mode="idle", tool=None, last_ref=None)
     try:
         await send_html(
@@ -1039,6 +1329,8 @@ def main():
     app.add_handler(CommandHandler("tickets", cmd_tickets, filters=admin))
     app.add_handler(CommandHandler("open", cmd_open, filters=admin))
     app.add_handler(CommandHandler("close", cmd_close, filters=admin))
+    app.add_handler(CommandHandler("tools", cmd_tools, filters=admin))
+    app.add_handler(CommandHandler("cancel", cmd_cancel, filters=admin))
     app.add_handler(CommandHandler("broadcast", cmd_broadcast, filters=admin))
     app.add_handler(CommandHandler("emoji", cmd_emoji, filters=admin))
     app.add_handler(CommandHandler("status", cmd_status, filters=admin))
@@ -1050,12 +1342,28 @@ def main():
     app.add_handler(CallbackQueryHandler(on_tool, pattern=r"^tool:"))
     app.add_handler(CallbackQueryHandler(on_days, pattern=r"^days:"))
     app.add_handler(CallbackQueryHandler(on_ticket_action, pattern=r"^tk:"))
+    app.add_handler(CallbackQueryHandler(on_tool_admin, pattern=r"^tl:"))
     app.add_handler(CallbackQueryHandler(on_broadcast_action, pattern=r"^bc:"))
 
     app.add_handler(MessageHandler(admin & ~filters.COMMAND, admin_relay))
     app.add_handler(MessageHandler(~filters.COMMAND, on_user_message))
 
     app.add_error_handler(on_error)
+
+    if app.job_queue:
+        app.job_queue.run_repeating(
+            job_autoclose, interval=900, first=120, name="autoclose"
+        )
+        if PING_MINUTES and WEBHOOK_URL:
+            app.job_queue.run_repeating(
+                job_keepalive, interval=PING_MINUTES * 60, first=60, name="keepalive"
+            )
+        log.info("Jobs scheduled (autoclose every 15m, ping every %sm)", PING_MINUTES)
+    else:
+        log.warning(
+            "JobQueue unavailable — install python-telegram-bot[job-queue] "
+            "for auto-close and keep-alive"
+        )
 
     if WEBHOOK_URL:
         log.info("Starting webhook on port %s", PORT)
