@@ -1,8 +1,9 @@
 """
-FropTools Support Bot — v4
+FropTools Support Bot — v5
 --------------------------
-Adds: duplicate-ticket guard, 24h idle auto-close, admin-managed tool list,
-and a self-pinger that keeps the Render service from spinning down.
+Adds on top of v4: unsend (delete a reply from the customer's chat at any
+time), automatic edit-sync (editing your message rewrites theirs), and a
+/sent browser listing recent replies with a tap-to-unsend button.
 
 Env vars:
   BOT_TOKEN        - from @BotFather                              (required)
@@ -15,7 +16,12 @@ Env vars:
   RATE_WINDOW      - window in seconds (default 20)               (optional)
   IDLE_HOURS       - auto-close idle tickets after N h (default 24)
   PING_MINUTES     - keep-alive interval (default 10, 0 disables)
+  RELAY_KEEP_DAYS  - how long to keep sent-reply records (default 30)
   DB_PATH          - defaults to support.db                       (optional)
+
+Note: Telegram only permits a bot to delete a message within 48 hours of it
+being sent, and never permits it to delete the admin's own messages. Unsend
+therefore removes the customer's copy only, and reports when it is too old.
 
 Requires: python-telegram-bot[webhooks,job-queue]==21.6
 """
@@ -65,6 +71,7 @@ RATE_WINDOW = int(os.environ.get("RATE_WINDOW", "20"))
 
 IDLE_HOURS = int(os.environ.get("IDLE_HOURS", "24"))
 PING_MINUTES = int(os.environ.get("PING_MINUTES", "10"))
+RELAY_KEEP_DAYS = int(os.environ.get("RELAY_KEEP_DAYS", "30"))
 
 DEFAULT_TOOLS = [
     "FropLogger",
@@ -263,6 +270,13 @@ def init_db():
                 admin_msg_id INTEGER PRIMARY KEY,
                 user_id      INTEGER NOT NULL
             );
+            CREATE TABLE IF NOT EXISTS relay_map (
+                admin_msg_id INTEGER PRIMARY KEY,
+                user_id      INTEGER NOT NULL,
+                user_msg_id  INTEGER NOT NULL,
+                sent_at      TEXT,
+                preview      TEXT
+            );
             CREATE TABLE IF NOT EXISTS tickets (
                 ref        TEXT PRIMARY KEY,
                 user_id    INTEGER NOT NULL,
@@ -304,6 +318,10 @@ def init_db():
                 "UPDATE tickets SET last_activity = created_at "
                 "WHERE last_activity IS NULL"
             )
+        # relay_map gained a preview column in v5
+        rcols = {r["name"] for r in conn.execute("PRAGMA table_info(relay_map)")}
+        if "preview" not in rcols:
+            conn.execute("ALTER TABLE relay_map ADD COLUMN preview TEXT")
         # seed the tool list on first run
         if not conn.execute("SELECT 1 FROM tools LIMIT 1").fetchone():
             conn.executemany(
@@ -423,6 +441,63 @@ def lookup_msg(admin_msg_id: int):
             "SELECT user_id FROM msg_map WHERE admin_msg_id = ?", (admin_msg_id,)
         ).fetchone()
     return row["user_id"] if row else None
+
+
+# --- relay map (admin message -> the copy the customer received) ------------
+
+
+def map_relay(admin_msg_id: int, user_id: int, user_msg_id: int, preview: str = ""):
+    with db() as conn:
+        conn.execute(
+            "INSERT OR REPLACE INTO relay_map "
+            "(admin_msg_id, user_id, user_msg_id, sent_at, preview) "
+            "VALUES (?,?,?,?,?)",
+            (admin_msg_id, user_id, user_msg_id,
+             now_wat().isoformat(timespec="seconds"), preview),
+        )
+
+
+def lookup_relay(admin_msg_id: int):
+    with db() as conn:
+        return conn.execute(
+            "SELECT * FROM relay_map WHERE admin_msg_id = ?", (admin_msg_id,)
+        ).fetchone()
+
+
+def drop_relay(admin_msg_id: int):
+    with db() as conn:
+        conn.execute("DELETE FROM relay_map WHERE admin_msg_id = ?", (admin_msg_id,))
+
+
+def purge_relays(days: int = RELAY_KEEP_DAYS):
+    """Housekeeping only — rows are kept well past Telegram's 48h delete window."""
+    cutoff = (now_wat() - timedelta(days=days)).isoformat(timespec="seconds")
+    with db() as conn:
+        conn.execute("DELETE FROM relay_map WHERE sent_at < ?", (cutoff,))
+
+
+def recent_relays(user_id: int | None = None, limit: int = 12):
+    q, params = "SELECT * FROM relay_map", []
+    if user_id:
+        q += " WHERE user_id = ?"
+        params.append(user_id)
+    q += " ORDER BY admin_msg_id DESC LIMIT ?"
+    params.append(limit)
+    with db() as conn:
+        return conn.execute(q, params).fetchall()
+
+
+def relay_preview(msg) -> str:
+    """A short label so /sent is readable without opening anything."""
+    if msg.text:
+        return msg.text.strip().replace("\n", " ")[:38]
+    if msg.caption:
+        return f"[media] {msg.caption.strip()[:30]}"
+    for kind in ("photo", "video", "document", "voice",
+                 "audio", "sticker", "animation"):
+        if getattr(msg, kind, None):
+            return f"[{kind}]"
+    return "[message]"
 
 
 # --- tickets ---------------------------------------------------------------
@@ -568,6 +643,13 @@ def duplicate_menu() -> InlineKeyboardMarkup:
             f"{plain('cross')}  Close it & start over", callback_data="menu:reset"
         )],
     ])
+
+
+def unsend_button(admin_msg_id: int) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([[InlineKeyboardButton(
+        f"{plain('cross')}  Unsend for customer",
+        callback_data=f"rm:{admin_msg_id}",
+    )]])
 
 
 def user_label(user) -> str:
@@ -935,6 +1017,168 @@ async def on_ticket_action(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 # ----------------------------------------------------------------------------
+# Unsend & edit-sync
+# ----------------------------------------------------------------------------
+
+_UNSEND_LABEL = {
+    "ok": "Removed from the customer's chat.",
+    "gone": "Already gone on their side.",
+    "too_old": "Too old — Telegram only allows deletion within 48h.",
+    "blocked": "That user has blocked the bot.",
+    "notfound": "No delivered copy tracked for that message.",
+}
+
+
+async def _unsend(bot, admin_msg_id: int) -> str:
+    rel = lookup_relay(admin_msg_id)
+    if not rel:
+        return "notfound"
+    try:
+        await bot.delete_message(rel["user_id"], rel["user_msg_id"])
+    except BadRequest as exc:
+        m = str(exc).lower()
+        if "not found" in m:
+            drop_relay(admin_msg_id)
+            return "gone"
+        if "can't be deleted" in m or "too old" in m:
+            return "too_old"
+        raise
+    except Forbidden:
+        deactivate_user(rel["user_id"])
+        return "blocked"
+    drop_relay(admin_msg_id)
+    return "ok"
+
+
+async def cmd_del(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Reply to a message you sent the customer, then /del."""
+    msg = update.effective_message
+    if not msg.reply_to_message:
+        return await msg.reply_text(
+            f"{plain('info')} Reply to the message you sent the customer, "
+            "then send /del.  (Or use /sent to pick from a list.)"
+        )
+    result = await _unsend(context.bot, msg.reply_to_message.message_id)
+    await msg.reply_text(
+        f"{plain('check') if result == 'ok' else plain('cross')} "
+        f"{_UNSEND_LABEL[result]}"
+    )
+
+
+def sent_panel(user_id: int | None = None):
+    rows = recent_relays(user_id)
+    scope = f"customer <code>{user_id}</code>" if user_id else "all customers"
+    if not rows:
+        return f"{e('info')} No tracked replies for {scope}.", None
+    kb = [[InlineKeyboardButton(
+        f"🗑  {r['sent_at'][5:16].replace('T', ' ')} · {r['preview'] or '…'}",
+        callback_data=f"rm:{r['admin_msg_id']}:{user_id or 0}",
+    )] for r in rows]
+    kb.append([InlineKeyboardButton("✕  Close", callback_data="rm:close:0")])
+    text = (
+        f"{e('rocket')} <b>Sent replies</b> — {scope}\n\n"
+        f"{e('info')} Tap a line to remove it from the customer's chat.\n"
+        f"{e('hourglass')} Telegram only allows deletion within 48h of sending."
+    )
+    return text, InlineKeyboardMarkup(kb)
+
+
+async def cmd_sent(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    msg = update.effective_message
+    uid = None
+    if context.args:
+        try:
+            uid = int(context.args[0])
+        except ValueError:
+            return await msg.reply_text("Usage: /sent [user_id]")
+    elif msg.reply_to_message:
+        uid = lookup_msg(msg.reply_to_message.message_id)
+    text, kb = sent_panel(uid)
+    await send_html(context.bot, ADMIN_ID, text, reply_markup=kb)
+
+
+async def on_relay_delete(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    if q.from_user.id != ADMIN_ID:
+        return await q.answer("Not authorised.", show_alert=True)
+
+    parts = q.data.split(":")
+
+    if parts[1] == "close":
+        await q.answer()
+        try:
+            return await q.delete_message()
+        except Exception:
+            return await edit_html(q, f"{e('check')} Closed.")
+
+    admin_msg_id = int(parts[1])
+    from_panel = len(parts) > 2
+    result = await _unsend(context.bot, admin_msg_id)
+    await q.answer(_UNSEND_LABEL[result], show_alert=result not in ("ok", "gone"))
+
+    if from_panel:
+        panel_user = int(parts[2]) or None
+        text, kb = sent_panel(panel_user)
+        return await edit_html(q, text, reply_markup=kb)
+
+    if result in ("ok", "gone"):
+        await edit_html(
+            q,
+            f"{e('cross')} <b>Unsent</b> — the customer no longer sees that "
+            f"message.\n{e('info')} Delete your own copy above manually; "
+            "Telegram won't let a bot remove your messages.",
+        )
+
+
+async def admin_edit(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Admin edited a relayed message — mirror the edit on the customer's side."""
+    msg = update.edited_message
+    rel = lookup_relay(msg.message_id)
+    if not rel:
+        return
+    try:
+        if msg.text is not None:
+            body = f"{e('user')} <b>Support Agent</b>\n\n{msg.text_html}"
+            try:
+                await context.bot.edit_message_text(
+                    body, chat_id=rel["user_id"], message_id=rel["user_msg_id"],
+                    parse_mode=ParseMode.HTML,
+                )
+            except BadRequest as exc:
+                if "custom emoji" not in str(exc).lower():
+                    raise
+                await context.bot.edit_message_text(
+                    degrade(body), chat_id=rel["user_id"],
+                    message_id=rel["user_msg_id"], parse_mode=ParseMode.HTML,
+                )
+        elif msg.caption is not None:
+            await context.bot.edit_message_caption(
+                chat_id=rel["user_id"], message_id=rel["user_msg_id"],
+                caption=msg.caption_html, parse_mode=ParseMode.HTML,
+            )
+        else:
+            return  # media swapped out — nothing sensible to mirror
+
+        map_relay(msg.message_id, rel["user_id"], rel["user_msg_id"],
+                  relay_preview(msg))
+        await msg.reply_text(
+            f"{plain('check')} Edit synced to the customer.",
+            reply_markup=unsend_button(msg.message_id),
+        )
+    except BadRequest as exc:
+        m = str(exc).lower()
+        if "not modified" in m:
+            return
+        await msg.reply_text(
+            f"{plain('cross')} Couldn't sync that edit: {exc}\n"
+            "Tip: /del it and send a fresh message."
+        )
+    except Forbidden:
+        deactivate_user(rel["user_id"])
+        await msg.reply_text(f"{plain('cross')} User has blocked the bot.")
+
+
+# ----------------------------------------------------------------------------
 # Tool manager (admin)
 # ----------------------------------------------------------------------------
 
@@ -1009,6 +1253,7 @@ async def cmd_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def job_autoclose(context: ContextTypes.DEFAULT_TYPE):
     """Close tickets with no activity for IDLE_HOURS."""
+    purge_relays()
     rows = stale_tickets(IDLE_HOURS)
     if not rows:
         return
@@ -1066,6 +1311,10 @@ async def admin_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"{e('bolt')} <b>Admin Console</b>\n\n"
         f"{e('user')} Reply to any message to answer that customer\n"
         f"{e('star')} <code>/reply &lt;user_id&gt; &lt;text&gt;</code> — direct reply\n"
+        f"{e('cross')} <code>/del</code> — reply to one of your messages to "
+        "unsend it\n"
+        f"{e('rocket')} <code>/sent [user_id]</code> — list your replies, "
+        "tap to unsend\n"
         f"{e('gem')} <code>/tickets</code> — recent tickets\n"
         f"{e('hourglass')} <code>/open</code> — tickets still open\n"
         f"{e('rocket')} <code>/tools</code> — add or remove tools\n"
@@ -1073,6 +1322,8 @@ async def admin_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"{e('cross')} <code>/close &lt;user_id&gt;</code> — close their ticket\n"
         f"{e('globe')} <code>/status</code> — hours, users, jobs\n"
         f"{e('info')} <code>/emoji</code> — premium emoji status\n\n"
+        f"{e('info')} <i>Editing one of your sent messages updates the "
+        "customer's copy automatically.</i>\n"
         f"Hours: <b>{hours_label()}</b> · auto-close after <b>{IDLE_HOURS}h</b> idle",
     )
 
@@ -1088,6 +1339,7 @@ async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
         open_t = conn.execute(
             "SELECT COUNT(*) c FROM tickets WHERE status != 'closed'"
         ).fetchone()["c"]
+        relays = conn.execute("SELECT COUNT(*) c FROM relay_map").fetchone()["c"]
     ping = f"every {PING_MINUTES} min" if PING_MINUTES else "disabled"
     await send_html(
         context.bot, ADMIN_ID,
@@ -1099,6 +1351,7 @@ async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"{e('sparkle')} Live chats: <b>{live}</b>\n"
         f"{e('hourglass')} Open tickets: <b>{open_t}</b>\n"
         f"{e('star')} Active tools: <b>{len(list_tools())}</b>\n"
+        f"{e('cross')} Unsendable replies tracked: <b>{relays}</b>\n"
         f"{e('rocket')} Keep-alive: <b>{ping}</b>\n"
         f"{e('gem')} Auto-close: <b>{IDLE_HOURS}h idle</b>",
     )
@@ -1207,19 +1460,25 @@ async def admin_relay(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         await typing(context.bot, user_id)
         if msg.text:
-            await send_html(
+            sent = await send_html(
                 context.bot, user_id,
                 f"{e('user')} <b>Support Agent</b>\n\n{msg.text_html}",
             )
         else:
-            await context.bot.copy_message(
+            sent = await context.bot.copy_message(
                 chat_id=user_id, from_chat_id=msg.chat_id, message_id=msg.message_id
             )
+        # remember which of their messages this produced, so we can unsend it
+        map_relay(msg.message_id, user_id, sent.message_id, relay_preview(msg))
+
         row = open_ticket_for(user_id)
         ref = row["ref"] if row else None
         set_state(user_id, mode="live", last_ref=ref)
         touch_ticket(ref)
-        await msg.reply_text(f"{plain('check')} Delivered.")
+        await msg.reply_text(
+            f"{plain('check')} Delivered.",
+            reply_markup=unsend_button(msg.message_id),
+        )
     except Forbidden:
         deactivate_user(user_id)
         await msg.reply_text(f"{plain('cross')} User has blocked the bot.")
@@ -1238,14 +1497,19 @@ async def cmd_reply(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = " ".join(context.args[1:])
     try:
         await typing(context.bot, user_id)
-        await send_html(
+        sent = await send_html(
             context.bot, user_id, f"{e('user')} <b>Support Agent</b>\n\n{text}"
         )
+        map_relay(msg.message_id, user_id, sent.message_id,
+                  text.replace("\n", " ")[:38])
         row = open_ticket_for(user_id)
         set_state(user_id, mode="live", last_ref=row["ref"] if row else None)
         if row:
             touch_ticket(row["ref"])
-        await msg.reply_text(f"{plain('check')} Delivered.")
+        await msg.reply_text(
+            f"{plain('check')} Delivered.",
+            reply_markup=unsend_button(msg.message_id),
+        )
     except Forbidden:
         deactivate_user(user_id)
         await msg.reply_text(f"{plain('cross')} User has blocked the bot.")
@@ -1326,6 +1590,8 @@ def main():
     admin = filters.User(ADMIN_ID)
 
     app.add_handler(CommandHandler("reply", cmd_reply, filters=admin))
+    app.add_handler(CommandHandler("del", cmd_del, filters=admin))
+    app.add_handler(CommandHandler("sent", cmd_sent, filters=admin))
     app.add_handler(CommandHandler("tickets", cmd_tickets, filters=admin))
     app.add_handler(CommandHandler("open", cmd_open, filters=admin))
     app.add_handler(CommandHandler("close", cmd_close, filters=admin))
@@ -1344,9 +1610,16 @@ def main():
     app.add_handler(CallbackQueryHandler(on_ticket_action, pattern=r"^tk:"))
     app.add_handler(CallbackQueryHandler(on_tool_admin, pattern=r"^tl:"))
     app.add_handler(CallbackQueryHandler(on_broadcast_action, pattern=r"^bc:"))
+    app.add_handler(CallbackQueryHandler(on_relay_delete, pattern=r"^rm:"))
 
-    app.add_handler(MessageHandler(admin & ~filters.COMMAND, admin_relay))
-    app.add_handler(MessageHandler(~filters.COMMAND, on_user_message))
+    # Edited messages must be caught BEFORE the relay handler, and both message
+    # handlers need an explicit update type, or every edit is relayed as new.
+    app.add_handler(MessageHandler(
+        admin & filters.UpdateType.EDITED_MESSAGE, admin_edit))
+    app.add_handler(MessageHandler(
+        admin & ~filters.COMMAND & filters.UpdateType.MESSAGE, admin_relay))
+    app.add_handler(MessageHandler(
+        ~filters.COMMAND & filters.UpdateType.MESSAGE, on_user_message))
 
     app.add_error_handler(on_error)
 
