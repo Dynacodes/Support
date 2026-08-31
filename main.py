@@ -1,9 +1,13 @@
 """
-FropTools Support Bot — v5
+FropTools Support Bot — v7
 --------------------------
-Adds on top of v4: unsend (delete a reply from the customer's chat at any
-time), automatic edit-sync (editing your message rewrites theirs), and a
-/sent browser listing recent replies with a tap-to-unsend button.
+v6 added the intent gate (screening + confirm step), strikes, cooldowns
+and bans. v7 adds the payment-details trap:
+
+The moment you send account/wallet details, the bot recognises them and
+starts a countdown. The customer must reply within the window or the
+ticket closes and they take a double strike. Anyone who collects your
+details twice without paying is banned automatically.
 
 Env vars:
   BOT_TOKEN        - from @BotFather                              (required)
@@ -17,6 +21,16 @@ Env vars:
   IDLE_HOURS       - auto-close idle tickets after N h (default 24)
   PING_MINUTES     - keep-alive interval (default 10, 0 disables)
   RELAY_KEEP_DAYS  - how long to keep sent-reply records (default 30)
+  MIN_CHARS        - shortest accepted opening message (default 12)
+  MIN_WORDS        - fewest words in an opening message (default 3)
+  MAX_JUNK         - low-effort tries before a cooldown (default 3)
+  GHOST_HOURS      - silence after an agent reply = ghost (default 6)
+  STRIKE_LIMIT     - ghosts before auto-restriction (default 3)
+  COOLDOWN_HOURS   - length of an automatic cooldown (default 12)
+  PAY_WINDOW_MIN   - minutes to pay after you send details (default 30)
+  PAY_EXTEND_MIN   - extra minutes if they ask once (default 20)
+  PAY_STRIKE       - strikes for ghosting after details (default 2)
+  DETAIL_LIMIT     - details-taken-without-paying before auto-ban (default 2)
   DB_PATH          - defaults to support.db                       (optional)
 
 Note: Telegram only permits a bot to delete a message within 48 hours of it
@@ -27,6 +41,7 @@ Requires: python-telegram-bot[webhooks,job-queue]==21.6
 """
 
 import asyncio
+import html as html_lib
 import logging
 import os
 import re
@@ -72,6 +87,18 @@ RATE_WINDOW = int(os.environ.get("RATE_WINDOW", "20"))
 IDLE_HOURS = int(os.environ.get("IDLE_HOURS", "24"))
 PING_MINUTES = int(os.environ.get("PING_MINUTES", "10"))
 RELAY_KEEP_DAYS = int(os.environ.get("RELAY_KEEP_DAYS", "30"))
+
+MIN_CHARS = int(os.environ.get("MIN_CHARS", "12"))
+MIN_WORDS = int(os.environ.get("MIN_WORDS", "3"))
+MAX_JUNK = int(os.environ.get("MAX_JUNK", "3"))
+GHOST_HOURS = int(os.environ.get("GHOST_HOURS", "6"))
+STRIKE_LIMIT = int(os.environ.get("STRIKE_LIMIT", "3"))
+COOLDOWN_HOURS = int(os.environ.get("COOLDOWN_HOURS", "12"))
+
+PAY_WINDOW_MIN = int(os.environ.get("PAY_WINDOW_MIN", "30"))
+PAY_EXTEND_MIN = int(os.environ.get("PAY_EXTEND_MIN", "20"))
+PAY_STRIKE = int(os.environ.get("PAY_STRIKE", "2"))
+DETAIL_LIMIT = int(os.environ.get("DETAIL_LIMIT", "2"))
 
 DEFAULT_TOOLS = [
     "FropLogger",
@@ -193,6 +220,10 @@ async def typing(bot, chat_id: int, seconds: float = 0.6):
         pass
 
 
+def esc(text: str) -> str:
+    return html_lib.escape(text or "")
+
+
 # ----------------------------------------------------------------------------
 # Business hours
 # ----------------------------------------------------------------------------
@@ -200,6 +231,10 @@ async def typing(bot, chat_id: int, seconds: float = 0.6):
 
 def now_wat() -> datetime:
     return datetime.now(WAT)
+
+
+def stamp() -> str:
+    return now_wat().isoformat(timespec="seconds")
 
 
 def within_hours() -> bool:
@@ -230,6 +265,7 @@ def offline_notice() -> str:
 
 _hits: dict[int, deque] = defaultdict(deque)
 _warned: dict[int, float] = {}
+_block_notice: dict[int, float] = {}
 
 
 def rate_ok(user_id: int) -> bool:
@@ -248,6 +284,15 @@ def should_warn(user_id: int) -> bool:
     if now - _warned.get(user_id, 0) < RATE_WINDOW:
         return False
     _warned[user_id] = now
+    return True
+
+
+def should_renotify(user_id: int, seconds: int = 300) -> bool:
+    """Don't repeat the 'you're restricted' notice on every message."""
+    now = time.time()
+    if now - _block_notice.get(user_id, 0) < seconds:
+        return False
+    _block_notice[user_id] = now
     return True
 
 
@@ -287,17 +332,27 @@ def init_db():
                 created_at TEXT
             );
             CREATE TABLE IF NOT EXISTS state (
-                user_id    INTEGER PRIMARY KEY,
-                mode       TEXT,
-                tool       TEXT,
-                last_ref   TEXT
+                user_id      INTEGER PRIMARY KEY,
+                mode         TEXT,
+                tool         TEXT,
+                last_ref     TEXT,
+                pending_msg  INTEGER,
+                pending_text TEXT
             );
             CREATE TABLE IF NOT EXISTS users (
-                user_id    INTEGER PRIMARY KEY,
-                username   TEXT,
-                full_name  TEXT,
-                first_seen TEXT,
-                active     INTEGER DEFAULT 1
+                user_id        INTEGER PRIMARY KEY,
+                username       TEXT,
+                full_name      TEXT,
+                first_seen     TEXT,
+                active         INTEGER DEFAULT 1,
+                banned         INTEGER DEFAULT 0,
+                ban_reason     TEXT,
+                banned_at      TEXT,
+                strikes        INTEGER DEFAULT 0,
+                junk           INTEGER DEFAULT 0,
+                trusted        INTEGER DEFAULT 0,
+                cooldown_until TEXT,
+                detail_hits    INTEGER DEFAULT 0
             );
             CREATE TABLE IF NOT EXISTS tools (
                 id       INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -307,6 +362,7 @@ def init_db():
             );
             """
         )
+
         cols = {r["name"] for r in conn.execute("PRAGMA table_info(tickets)")}
         if "kind" not in cols:
             conn.execute("ALTER TABLE tickets ADD COLUMN kind TEXT DEFAULT 'license'")
@@ -318,10 +374,48 @@ def init_db():
                 "UPDATE tickets SET last_activity = created_at "
                 "WHERE last_activity IS NULL"
             )
-        # relay_map gained a preview column in v5
+        # v6: ghost tracking
+        if "agent_replied" not in cols:
+            conn.execute(
+                "ALTER TABLE tickets ADD COLUMN agent_replied INTEGER DEFAULT 0"
+            )
+        if "awaiting_since" not in cols:
+            conn.execute("ALTER TABLE tickets ADD COLUMN awaiting_since TEXT")
+        # v7: payment window
+        for col, ddl in (
+            ("got_details", "got_details INTEGER DEFAULT 0"),
+            ("pay_deadline", "pay_deadline TEXT"),
+            ("pay_reminded", "pay_reminded INTEGER DEFAULT 0"),
+            ("pay_extended", "pay_extended INTEGER DEFAULT 0"),
+        ):
+            if col not in cols:
+                conn.execute(f"ALTER TABLE tickets ADD COLUMN {ddl}")
+
         rcols = {r["name"] for r in conn.execute("PRAGMA table_info(relay_map)")}
         if "preview" not in rcols:
             conn.execute("ALTER TABLE relay_map ADD COLUMN preview TEXT")
+
+        # v6: screening + moderation columns on existing installs
+        ucols = {r["name"] for r in conn.execute("PRAGMA table_info(users)")}
+        for col, ddl in (
+            ("banned", "banned INTEGER DEFAULT 0"),
+            ("ban_reason", "ban_reason TEXT"),
+            ("banned_at", "banned_at TEXT"),
+            ("strikes", "strikes INTEGER DEFAULT 0"),
+            ("junk", "junk INTEGER DEFAULT 0"),
+            ("trusted", "trusted INTEGER DEFAULT 0"),
+            ("cooldown_until", "cooldown_until TEXT"),
+            ("detail_hits", "detail_hits INTEGER DEFAULT 0"),
+        ):
+            if col not in ucols:
+                conn.execute(f"ALTER TABLE users ADD COLUMN {ddl}")
+
+        scols = {r["name"] for r in conn.execute("PRAGMA table_info(state)")}
+        if "pending_msg" not in scols:
+            conn.execute("ALTER TABLE state ADD COLUMN pending_msg INTEGER")
+        if "pending_text" not in scols:
+            conn.execute("ALTER TABLE state ADD COLUMN pending_text TEXT")
+
         # seed the tool list on first run
         if not conn.execute("SELECT 1 FROM tools LIMIT 1").fetchone():
             conn.executemany(
@@ -383,9 +477,15 @@ def remember_user(user):
             "INSERT INTO users (user_id, username, full_name, first_seen, active) "
             "VALUES (?,?,?,?,1) ON CONFLICT(user_id) DO UPDATE SET "
             "username=excluded.username, full_name=excluded.full_name, active=1",
-            (user.id, user.username, user.full_name,
-             now_wat().isoformat(timespec="seconds")),
+            (user.id, user.username, user.full_name, stamp()),
         )
+
+
+def get_user(user_id: int):
+    with db() as conn:
+        return conn.execute(
+            "SELECT * FROM users WHERE user_id = ?", (user_id,)
+        ).fetchone()
 
 
 def deactivate_user(user_id: int):
@@ -396,10 +496,197 @@ def deactivate_user(user_id: int):
 def all_active_users() -> list[int]:
     with db() as conn:
         rows = conn.execute(
-            "SELECT user_id FROM users WHERE active = 1 AND user_id != ?",
+            "SELECT user_id FROM users WHERE active = 1 AND banned = 0 "
+            "AND user_id != ?",
             (ADMIN_ID,),
         ).fetchall()
     return [r["user_id"] for r in rows]
+
+
+# --- moderation ------------------------------------------------------------
+
+
+def ban_user(user_id: int, reason: str = ""):
+    with db() as conn:
+        conn.execute(
+            "INSERT INTO users (user_id, banned, ban_reason, banned_at, first_seen) "
+            "VALUES (?,1,?,?,?) ON CONFLICT(user_id) DO UPDATE SET "
+            "banned=1, ban_reason=excluded.ban_reason, banned_at=excluded.banned_at",
+            (user_id, reason, stamp(), stamp()),
+        )
+
+
+def unban_user(user_id: int):
+    with db() as conn:
+        conn.execute(
+            "UPDATE users SET banned = 0, ban_reason = NULL, banned_at = NULL, "
+            "strikes = 0, junk = 0, cooldown_until = NULL WHERE user_id = ?",
+            (user_id,),
+        )
+
+
+def trust_user(user_id: int, on: bool = True):
+    with db() as conn:
+        conn.execute(
+            "UPDATE users SET trusted = ?, strikes = 0, junk = 0, "
+            "cooldown_until = NULL WHERE user_id = ?",
+            (1 if on else 0, user_id),
+        )
+
+
+def is_trusted(user_id: int) -> bool:
+    row = get_user(user_id)
+    return bool(row and row["trusted"])
+
+
+def set_cooldown(user_id: int, hours: int):
+    until = (now_wat() + timedelta(hours=hours)).isoformat(timespec="seconds")
+    with db() as conn:
+        conn.execute(
+            "UPDATE users SET cooldown_until = ? WHERE user_id = ?", (until, user_id)
+        )
+    return until
+
+
+def add_strike(user_id: int, weight: int = 1) -> int:
+    with db() as conn:
+        conn.execute(
+            "UPDATE users SET strikes = COALESCE(strikes, 0) + ? WHERE user_id = ?",
+            (weight, user_id),
+        )
+        row = conn.execute(
+            "SELECT strikes FROM users WHERE user_id = ?", (user_id,)
+        ).fetchone()
+    return row["strikes"] if row else 0
+
+
+def bump_detail_hit(user_id: int) -> int:
+    """Count how many times this person took payment details and never paid."""
+    with db() as conn:
+        conn.execute(
+            "UPDATE users SET detail_hits = COALESCE(detail_hits, 0) + 1 "
+            "WHERE user_id = ?", (user_id,),
+        )
+        row = conn.execute(
+            "SELECT detail_hits FROM users WHERE user_id = ?", (user_id,)
+        ).fetchone()
+    return row["detail_hits"] if row else 0
+
+
+def bump_junk(user_id: int) -> int:
+    with db() as conn:
+        conn.execute(
+            "UPDATE users SET junk = COALESCE(junk, 0) + 1 WHERE user_id = ?",
+            (user_id,),
+        )
+        row = conn.execute(
+            "SELECT junk FROM users WHERE user_id = ?", (user_id,)
+        ).fetchone()
+    return row["junk"] if row else 0
+
+
+def clear_junk(user_id: int):
+    with db() as conn:
+        conn.execute("UPDATE users SET junk = 0 WHERE user_id = ?", (user_id,))
+
+
+def banned_list():
+    with db() as conn:
+        return conn.execute(
+            "SELECT * FROM users WHERE banned = 1 OR cooldown_until IS NOT NULL "
+            "OR strikes > 0 OR detail_hits > 0 "
+            "ORDER BY banned DESC, detail_hits DESC, strikes DESC LIMIT 25"
+        ).fetchall()
+
+
+def block_status(user_id: int):
+    """None, ('banned', reason) or ('cooldown', iso_until)."""
+    row = get_user(user_id)
+    if not row:
+        return None
+    if row["banned"]:
+        return ("banned", row["ban_reason"] or "")
+    cd = row["cooldown_until"]
+    if cd and cd > stamp():
+        return ("cooldown", cd)
+    if cd:  # expired — clean it up
+        with db() as conn:
+            conn.execute(
+                "UPDATE users SET cooldown_until = NULL WHERE user_id = ?",
+                (user_id,),
+            )
+    return None
+
+
+def block_text(kind: str, detail: str) -> str:
+    if kind == "banned":
+        why = f"\n{e('info')} Reason: <i>{esc(detail)}</i>" if detail else ""
+        return (
+            f"{e('cross')} <b>Access restricted</b>\n\n"
+            f"Your access to this support bot has been revoked.{why}"
+        )
+    when = detail[11:16] if len(detail) >= 16 else detail
+    day = "today" if detail[:10] == stamp()[:10] else "tomorrow"
+    return (
+        f"{e('hourglass')} <b>Temporarily paused</b>\n\n"
+        "Tickets you opened were left unanswered, so new requests are on hold.\n"
+        f"{e('info')} You can start again {day} after <b>{when} WAT</b>."
+    )
+
+
+# --- opening-message screening ---------------------------------------------
+
+LOW_EFFORT = {
+    "hi", "hii", "hiii", "hello", "helo", "hey", "heyy", "yo", "sup", "hola",
+    "good morning", "good afternoon", "good evening", "good day", "gm", "gn",
+    "test", "testing", "test test", "ok", "okay", "k", "yes", "no", "yeah",
+    "lol", "lmao", "haha", "hehe", "hmm", "hm", "abeg", "bro", "boss",
+    "chief", "guy", "man", "please", "pls", "abi", "wetin", "sup bro",
+    "hello sir", "hi sir", "hi boss", "hello boss", "hello there", "hi there",
+    "you dey", "how far", "info", "help", "hey man", "are you there",
+    "is anyone there", "anybody there", "who are you", "are you a bot",
+    "are you real", "is this real", "what is this", "u there", "you there",
+}
+
+_WORD_RE = re.compile(r"[a-z0-9]+")
+_REF_RE = re.compile(r"\bFT-[A-Z0-9]{4}-[A-Z0-9]{4}\b", re.I)
+
+
+def screen_opening(text: str | None) -> tuple[bool, str]:
+    """Decide whether a first message is worth an agent's time."""
+    if not text or not text.strip():
+        return False, (
+            "Start with a written message, please — photos and files can "
+            "follow once your ticket is open."
+        )
+
+    body = text.strip()
+    low = body.lower().strip(" .!?,-")
+
+    if _REF_RE.search(body):          # quoting a real ticket ref = genuine
+        return True, ""
+
+    if low in LOW_EFFORT:
+        return False, (
+            "Tell us the actual issue in one message — which tool, and what "
+            "went wrong. A greeting on its own doesn't reach an agent."
+        )
+
+    words = _WORD_RE.findall(low)
+    if len(body) < MIN_CHARS or len(words) < MIN_WORDS:
+        return False, (
+            f"That's a bit short. Give us at least a sentence "
+            f"({MIN_CHARS}+ characters) describing what you need."
+        )
+
+    if len(set(low.replace(" ", ""))) <= 3:
+        return False, "That doesn't read like a real message. Please try again."
+
+    letters = sum(c.isalpha() for c in body)
+    if letters < len(body) * 0.4:
+        return False, "Please write your request in plain words."
+
+    return True, ""
 
 
 # --- state -----------------------------------------------------------------
@@ -411,7 +698,8 @@ def get_state(user_id: int) -> dict:
             "SELECT * FROM state WHERE user_id = ?", (user_id,)
         ).fetchone()
     return dict(row) if row else {
-        "user_id": user_id, "mode": "idle", "tool": None, "last_ref": None
+        "user_id": user_id, "mode": "idle", "tool": None, "last_ref": None,
+        "pending_msg": None, "pending_text": None,
     }
 
 
@@ -420,10 +708,13 @@ def set_state(user_id: int, **kw):
     cur.update(kw)
     with db() as conn:
         conn.execute(
-            "INSERT INTO state (user_id, mode, tool, last_ref) VALUES (?,?,?,?) "
+            "INSERT INTO state (user_id, mode, tool, last_ref, pending_msg, "
+            "pending_text) VALUES (?,?,?,?,?,?) "
             "ON CONFLICT(user_id) DO UPDATE SET mode=excluded.mode, "
-            "tool=excluded.tool, last_ref=excluded.last_ref",
-            (user_id, cur.get("mode"), cur.get("tool"), cur.get("last_ref")),
+            "tool=excluded.tool, last_ref=excluded.last_ref, "
+            "pending_msg=excluded.pending_msg, pending_text=excluded.pending_text",
+            (user_id, cur.get("mode"), cur.get("tool"), cur.get("last_ref"),
+             cur.get("pending_msg"), cur.get("pending_text")),
         )
 
 
@@ -452,8 +743,7 @@ def map_relay(admin_msg_id: int, user_id: int, user_msg_id: int, preview: str = 
             "INSERT OR REPLACE INTO relay_map "
             "(admin_msg_id, user_id, user_msg_id, sent_at, preview) "
             "VALUES (?,?,?,?,?)",
-            (admin_msg_id, user_id, user_msg_id,
-             now_wat().isoformat(timespec="seconds"), preview),
+            (admin_msg_id, user_id, user_msg_id, stamp(), preview),
         )
 
 
@@ -517,14 +807,14 @@ def new_reference() -> str:
 
 def create_ticket(user, kind, tool=None, days=None) -> str:
     ref = new_reference()
-    stamp = now_wat().isoformat(timespec="seconds")
+    now = stamp()
     with db() as conn:
         conn.execute(
             "INSERT INTO tickets (ref, user_id, username, tool, days, status, "
             "created_at, kind, last_activity) VALUES (?,?,?,?,?,?,?,?,?)",
             (ref, user.id, user.username or user.full_name, tool, days,
              "awaiting_payment" if kind == "license" else "open",
-             stamp, kind, stamp),
+             now, kind, now),
         )
     return ref
 
@@ -546,15 +836,129 @@ def set_ticket_admin_msg(ref: str, msg_id: int):
         )
 
 
-def touch_ticket(ref: str):
-    """Reset the idle clock — called on every message either way."""
+def touch_ticket(ref: str, by_user: bool = False):
+    """Reset the idle clock; a customer message also clears the ghost clock."""
+    if not ref:
+        return
+    with db() as conn:
+        if by_user:
+            # They answered — the ghost and payment clocks both stop. The
+            # got_details flag stays, so a later no-show still costs double.
+            conn.execute(
+                "UPDATE tickets SET last_activity = ?, awaiting_since = NULL, "
+                "pay_deadline = NULL WHERE ref = ?", (stamp(), ref),
+            )
+        else:
+            conn.execute(
+                "UPDATE tickets SET last_activity = ? WHERE ref = ?",
+                (stamp(), ref),
+            )
+
+
+def mark_agent_reply(ref: str):
+    """Start the ghost clock: the ball is now in the customer's court."""
     if not ref:
         return
     with db() as conn:
         conn.execute(
-            "UPDATE tickets SET last_activity = ? WHERE ref = ?",
-            (now_wat().isoformat(timespec="seconds"), ref),
+            "UPDATE tickets SET agent_replied = 1, awaiting_since = ?, "
+            "last_activity = ? WHERE ref = ?", (stamp(), stamp(), ref),
         )
+
+
+# --- payment details & window ----------------------------------------------
+
+_ACCT_RE = re.compile(r"(?<!\d)\d{10}(?!\d)")            # NUBAN
+_CRYPTO_RE = re.compile(
+    r"\b(0x[a-fA-F0-9]{40}|T[1-9A-HJ-NP-Za-km-z]{33}|"
+    r"bc1[ac-hj-np-z02-9]{20,}|[13][a-km-zA-HJ-NP-Z1-9]{25,34})\b"
+)
+_PAY_WORDS = re.compile(
+    r"\b(acct|account|opay|palmpay|moniepoint|kuda|gtb|gtbank|uba|zenith|"
+    r"access bank|first bank|fidelity|wema|sterling|bank|transfer|send to|"
+    r"pay to|usdt|trc20|erc20|bep20|btc|wallet address|binance id)\b", re.I
+)
+
+
+def looks_like_payment_details(text: str | None) -> bool:
+    if not text:
+        return False
+    if _CRYPTO_RE.search(text):
+        return True
+    if _ACCT_RE.search(text) and _PAY_WORDS.search(text):
+        return True
+    # an account number alone, on its own line, still counts
+    return bool(_ACCT_RE.search(text) and len(text) < 120)
+
+
+def start_pay_window(ref: str, minutes: int = PAY_WINDOW_MIN) -> str:
+    deadline = (now_wat() + timedelta(minutes=minutes)).isoformat(
+        timespec="seconds")
+    with db() as conn:
+        conn.execute(
+            "UPDATE tickets SET got_details = 1, pay_deadline = ?, "
+            "pay_reminded = 0, agent_replied = 1, awaiting_since = ?, "
+            "last_activity = ? WHERE ref = ?",
+            (deadline, stamp(), stamp(), ref),
+        )
+    return deadline
+
+
+def extend_pay_window(ref: str, minutes: int = PAY_EXTEND_MIN) -> str | None:
+    row = get_ticket(ref)
+    if not row or row["pay_extended"]:
+        return None
+    deadline = (now_wat() + timedelta(minutes=minutes)).isoformat(
+        timespec="seconds")
+    with db() as conn:
+        conn.execute(
+            "UPDATE tickets SET pay_deadline = ?, pay_extended = 1, "
+            "pay_reminded = 0 WHERE ref = ?", (deadline, ref),
+        )
+    return deadline
+
+
+def clear_pay_window(ref: str):
+    with db() as conn:
+        conn.execute(
+            "UPDATE tickets SET pay_deadline = NULL WHERE ref = ?", (ref,)
+        )
+
+
+def settle_ticket(ref: str):
+    """They paid — drop every penalty flag on this ticket."""
+    with db() as conn:
+        conn.execute(
+            "UPDATE tickets SET got_details = 0, pay_deadline = NULL, "
+            "awaiting_since = NULL WHERE ref = ?", (ref,)
+        )
+
+
+def mark_reminded(ref: str):
+    with db() as conn:
+        conn.execute(
+            "UPDATE tickets SET pay_reminded = 1 WHERE ref = ?", (ref,)
+        )
+
+
+def pay_due_tickets():
+    """Tickets whose payment window has run out."""
+    with db() as conn:
+        return conn.execute(
+            "SELECT * FROM tickets WHERE status != 'closed' "
+            "AND pay_deadline IS NOT NULL AND pay_deadline < ?", (stamp(),)
+        ).fetchall()
+
+
+def pay_reminder_tickets(minutes: int = 5):
+    cutoff = (now_wat() + timedelta(minutes=minutes)).isoformat(
+        timespec="seconds")
+    with db() as conn:
+        return conn.execute(
+            "SELECT * FROM tickets WHERE status != 'closed' "
+            "AND pay_deadline IS NOT NULL AND pay_reminded = 0 "
+            "AND pay_deadline <= ? AND pay_deadline > ?", (cutoff, stamp())
+        ).fetchall()
 
 
 def open_ticket_for(user_id: int):
@@ -571,6 +975,16 @@ def stale_tickets(hours: int):
     with db() as conn:
         return conn.execute(
             "SELECT * FROM tickets WHERE status != 'closed' AND last_activity < ?",
+            (cutoff,),
+        ).fetchall()
+
+
+def ghosted_tickets(hours: int):
+    cutoff = (now_wat() - timedelta(hours=hours)).isoformat(timespec="seconds")
+    with db() as conn:
+        return conn.execute(
+            "SELECT * FROM tickets WHERE status != 'closed' AND agent_replied = 1 "
+            "AND awaiting_since IS NOT NULL AND awaiting_since < ?",
             (cutoff,),
         ).fetchall()
 
@@ -628,6 +1042,27 @@ def days_menu() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(rows)
 
 
+def order_confirm_menu(days: int) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton(
+            f"{plain('check')}  Yes, I'm ready to pay", callback_data=f"ord:{days}"
+        )],
+        [InlineKeyboardButton("‹  Change duration", callback_data="menu:buy")],
+    ])
+
+
+def send_confirm_menu() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton(
+            f"{plain('rocket')}  Send to agent", callback_data="ok:send"
+        )],
+        [InlineKeyboardButton(
+            f"{plain('cross')}  Rewrite it", callback_data="ok:edit"
+        )],
+        [InlineKeyboardButton("‹  Cancel", callback_data="menu:home")],
+    ])
+
+
 def end_chat_menu() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         [[InlineKeyboardButton("‹  End chat / Main menu", callback_data="menu:home")]]
@@ -650,6 +1085,37 @@ def unsend_button(admin_msg_id: int) -> InlineKeyboardMarkup:
         f"{plain('cross')}  Unsend for customer",
         callback_data=f"rm:{admin_msg_id}",
     )]])
+
+
+def delivered_menu(admin_msg_id: int, ref: str | None) -> InlineKeyboardMarkup:
+    rows = [[InlineKeyboardButton(
+        f"{plain('cross')}  Unsend for customer",
+        callback_data=f"rm:{admin_msg_id}",
+    )]]
+    if ref:
+        rows.append([InlineKeyboardButton(
+            f"💳  Payment details sent — start {PAY_WINDOW_MIN}m timer",
+            callback_data=f"pd:start:{ref}",
+        )])
+    return InlineKeyboardMarkup(rows)
+
+
+def pay_window_menu() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton(
+            f"{plain('hourglass')}  I need more time", callback_data="pay:more"
+        )],
+        [InlineKeyboardButton(
+            f"{plain('cross')}  Cancel — I'm not paying", callback_data="pay:cancel"
+        )],
+    ])
+
+
+def strike_menu(user_id: int) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([[
+        InlineKeyboardButton("🚫  Ban permanently", callback_data=f"bn:ban:{user_id}"),
+        InlineKeyboardButton("♻️  Clear strikes", callback_data=f"bn:clear:{user_id}"),
+    ]])
 
 
 def user_label(user) -> str:
@@ -692,11 +1158,29 @@ def ticket_keyboard(ref: str, status: str, kind: str) -> InlineKeyboardMarkup:
         rows.append([InlineKeyboardButton(
             f"{plain('cross')} Close ticket", callback_data=f"tk:close:{ref}"
         )])
+    rows.append([InlineKeyboardButton(
+        "🚫  Ban this customer", callback_data=f"tk:ban:{ref}"
+    )])
     return InlineKeyboardMarkup(rows)
 
 
 def ticket_admin_text(row) -> str:
     status = STATUS_LABEL.get(row["status"], row["status"])
+    urow = get_user(row["user_id"])
+    flags = ""
+    if urow:
+        if urow["trusted"]:
+            flags += f"\n{e('check')} <i>Trusted customer</i>"
+        if urow["strikes"]:
+            flags += f"\n{e('cross')} <i>Strikes: {urow['strikes']}</i>"
+        if urow["detail_hits"]:
+            flags += (f"\n{e('cross')} <i>Took details without paying: "
+                      f"{urow['detail_hits']}×</i>")
+    if row["pay_deadline"]:
+        flags += (f"\n💳 <i>Payment window ends "
+                  f"{row['pay_deadline'][11:16]} WAT</i>")
+    elif row["got_details"]:
+        flags += f"\n💳 <i>Has your payment details</i>"
     if row["kind"] == "license":
         head = f"{e('gem')} <b>LICENSE REQUEST</b>"
         body = (f"{e('rocket')} Tool: <b>{row['tool']}</b>\n"
@@ -709,7 +1193,7 @@ def ticket_admin_text(row) -> str:
         f"{e('star')} Ref: <code>{row['ref']}</code>\n"
         f"{body}"
         f"{e('user')} User: @{row['username']} — <code>{row['user_id']}</code>\n"
-        f"{e('info')} Status: <b>{status}</b>\n\n"
+        f"{e('info')} Status: <b>{status}</b>{flags}\n\n"
         f"<i>Reply to this message to talk to the customer.</i>"
     )
 
@@ -729,6 +1213,37 @@ def duplicate_notice(row) -> str:
 
 
 # ----------------------------------------------------------------------------
+# Access gate
+# ----------------------------------------------------------------------------
+
+
+async def gate(context, user, q=None) -> bool:
+    """True if this user is banned or cooling down (notice already shown)."""
+    if user.id == ADMIN_ID:
+        return False
+    st = block_status(user.id)
+    if not st:
+        return False
+    kind, detail = st
+    text = block_text(kind, detail)
+    if q:
+        await q.answer(
+            "Access restricted." if kind == "banned" else "Temporarily paused.",
+            show_alert=True,
+        )
+        try:
+            await edit_html(q, text)
+        except Exception:
+            pass
+    elif should_renotify(user.id):
+        try:
+            await send_html(context.bot, user.id, text)
+        except Exception:
+            pass
+    return True
+
+
+# ----------------------------------------------------------------------------
 # User handlers
 # ----------------------------------------------------------------------------
 
@@ -737,20 +1252,25 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     if user.id == ADMIN_ID:
         return await admin_help(update, context)
+    if await gate(context, user):
+        return
     remember_user(user)
-    set_state(user.id, mode="idle", tool=None)
+    set_state(user.id, mode="idle", tool=None, pending_msg=None, pending_text=None)
     await send_html(context.bot, user.id, welcome_text(), reply_markup=main_menu())
 
 
 async def on_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
+    user = q.from_user
+    if await gate(context, user, q):
+        return
     await q.answer()
     action = q.data.split(":", 1)[1]
-    user = q.from_user
     remember_user(user)
 
     if action == "home":
-        set_state(user.id, mode="idle", tool=None)
+        set_state(user.id, mode="idle", tool=None,
+                  pending_msg=None, pending_text=None)
         return await edit_html(q, welcome_text(), reply_markup=main_menu())
 
     if action == "resume":
@@ -759,7 +1279,7 @@ async def on_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
             set_state(user.id, mode="idle", tool=None, last_ref=None)
             return await edit_html(q, welcome_text(), reply_markup=main_menu())
         set_state(user.id, mode="live", last_ref=row["ref"])
-        touch_ticket(row["ref"])
+        touch_ticket(row["ref"], by_user=True)
         return await edit_html(
             q,
             f"{e('bolt')} <b>You're back on ticket "
@@ -777,7 +1297,8 @@ async def on_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 context.bot, ADMIN_ID,
                 f"{e('info')} <code>{row['ref']}</code> was closed by the customer.",
             )
-        set_state(user.id, mode="idle", tool=None, last_ref=None)
+        set_state(user.id, mode="idle", tool=None, last_ref=None,
+                  pending_msg=None, pending_text=None)
         return await edit_html(q, welcome_text(), reply_markup=main_menu())
 
     # --- duplicate guard: one live ticket per user --------------------------
@@ -804,16 +1325,26 @@ async def on_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
 
     elif action == "agent":
-        set_state(user.id, mode="await_message")
-        text = (f"{e('user')} <b>Live Agent</b>\n\n"
-                "Type the message you'd like to send to our support team.\n")
-        text += (f"{e('bolt')} An agent will reply right here."
+        set_state(user.id, mode="await_message",
+                  pending_msg=None, pending_text=None)
+        text = (
+            f"{e('user')} <b>Live Agent</b>\n\n"
+            "In <b>one message</b>, tell us:\n"
+            f"{e('star')} which tool you're using\n"
+            f"{e('star')} what exactly went wrong\n\n"
+            f"{e('info')} <i>You'll see a preview and confirm before it's sent. "
+            "One-word messages and jokes aren't forwarded, and repeat "
+            "time-wasting gets your access paused.</i>\n"
+        )
+        text += (f"\n{e('bolt')} An agent will reply right here."
                  if within_hours() else f"\n{offline_notice()}")
         await edit_html(q, text)
 
 
 async def on_tool(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
+    if await gate(context, q.from_user, q):
+        return
     await q.answer()
     row = tool_by_id(int(q.data.split(":", 1)[1]))
     if not row:
@@ -832,10 +1363,45 @@ async def on_tool(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def on_days(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Duration chosen — show a confirmation step instead of pinging admin."""
     q = update.callback_query
+    if await gate(context, q.from_user, q):
+        return
     await q.answer()
     days = int(q.data.split(":", 1)[1])
     user = q.from_user
+
+    existing = open_ticket_for(user.id)
+    if existing:
+        return await edit_html(
+            q, duplicate_notice(existing), reply_markup=duplicate_menu()
+        )
+
+    tool = get_state(user.id).get("tool")
+    if not tool:
+        return await edit_html(
+            q, f"{e('cross')} Session expired. Please start again.",
+            reply_markup=main_menu(),
+        )
+
+    await edit_html(
+        q,
+        f"{e('gem')} <b>Confirm your order</b>\n\n"
+        f"{e('star')} Tool: <b>{tool}</b>\n"
+        f"{e('hourglass')} Duration: <b>{days} days</b>\n\n"
+        f"{e('info')} Confirming opens a live ticket with a real agent. "
+        "Only continue if you intend to pay today.",
+        reply_markup=order_confirm_menu(days),
+    )
+
+
+async def on_order_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    user = q.from_user
+    if await gate(context, user, q):
+        return
+    await q.answer()
+    days = int(q.data.split(":", 1)[1])
 
     existing = open_ticket_for(user.id)
     if existing:
@@ -876,13 +1442,80 @@ async def on_days(update: Update, context: ContextTypes.DEFAULT_TYPE):
     set_ticket_admin_msg(ref, sent.message_id)
 
 
+async def on_send_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """The customer confirmed (or wants to rewrite) their screened message."""
+    q = update.callback_query
+    user = q.from_user
+    if await gate(context, user, q):
+        return
+    action = q.data.split(":", 1)[1]
+    st = get_state(user.id)
+
+    if action == "edit":
+        await q.answer()
+        set_state(user.id, mode="await_message",
+                  pending_msg=None, pending_text=None)
+        return await edit_html(
+            q,
+            f"{e('user')} <b>Go ahead</b>\n\n"
+            "Send the message you'd like the agent to read.",
+        )
+
+    pending = st.get("pending_msg")
+    if not pending:
+        await q.answer("Nothing to send.", show_alert=True)
+        return await edit_html(q, welcome_text(), reply_markup=main_menu())
+
+    await q.answer("Sending…")
+
+    existing = open_ticket_for(user.id)
+    ref = existing["ref"] if existing else create_ticket(user, "support")
+    set_state(user.id, mode="live", last_ref=ref,
+              pending_msg=None, pending_text=None)
+    touch_ticket(ref, by_user=True)
+    clear_junk(user.id)
+
+    await typing(context.bot, ADMIN_ID)
+    row = get_ticket(ref)
+    header = await send_html(
+        context.bot, ADMIN_ID, ticket_admin_text(row),
+        reply_markup=ticket_keyboard(ref, row["status"], row["kind"]),
+    )
+    set_ticket_admin_msg(ref, header.message_id)
+    map_msg(header.message_id, user.id)
+
+    try:
+        copied = await context.bot.copy_message(
+            chat_id=ADMIN_ID, from_chat_id=user.id, message_id=pending
+        )
+        map_msg(copied.message_id, user.id)
+    except Exception as exc:
+        log.warning("Could not copy pending message: %s", exc)
+        body = esc(st.get("pending_text") or "")
+        copied = await send_html(context.bot, ADMIN_ID, body)
+        map_msg(copied.message_id, user.id)
+
+    ack = (f"{e('check')} Your message has been delivered to our support team.\n"
+           f"{e('gem')} Ticket: <code>{ref}</code>\n")
+    ack += (f"{e('hourglass')} An agent will reply here shortly. "
+            "Please stay available — tickets left unanswered are closed and "
+            "counted against your account."
+            if within_hours() else f"\n{offline_notice()}")
+    await edit_html(q, ack, reply_markup=end_chat_menu())
+
+
 async def on_user_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     msg = update.effective_message
     user = update.effective_user
+
+    if await gate(context, user):
+        return
+
     remember_user(user)
     st = get_state(user.id)
+    mode = st.get("mode")
 
-    if st.get("mode") not in ("await_message", "live"):
+    if mode not in ("await_message", "confirm", "live"):
         return await send_html(
             context.bot, user.id, welcome_text(), reply_markup=main_menu()
         )
@@ -897,29 +1530,72 @@ async def on_user_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
         return
 
-    first_contact = st.get("mode") == "await_message"
-    ref = st.get("last_ref")
+    # --- opening message: screen it, then ask for confirmation --------------
+    if mode in ("await_message", "confirm"):
+        if is_trusted(user.id):
+            ok, why = True, ""
+        else:
+            ok, why = screen_opening(msg.text or msg.caption)
 
-    if first_contact and not ref:
-        ref = create_ticket(user, "support")
+        if not ok:
+            junk = bump_junk(user.id)
+            left = MAX_JUNK - junk
+            if junk >= MAX_JUNK:
+                until = set_cooldown(user.id, COOLDOWN_HOURS)
+                clear_junk(user.id)
+                set_state(user.id, mode="idle", pending_msg=None,
+                          pending_text=None)
+                await send_html(
+                    context.bot, user.id, block_text("cooldown", until)
+                )
+                return await send_html(
+                    context.bot, ADMIN_ID,
+                    f"{e('hourglass')} <b>Auto-paused</b> — "
+                    f"{user_label(user)} sent {MAX_JUNK} low-effort openers. "
+                    f"On hold for {COOLDOWN_HOURS}h.",
+                    reply_markup=strike_menu(user.id),
+                )
+            return await send_html(
+                context.bot, user.id,
+                f"{e('info')} <b>Not sent yet</b>\n\n{why}\n\n"
+                f"{e('hourglass')} <i>{left} attempt(s) left before your "
+                "access is paused.</i>",
+            )
+
+        preview = esc((msg.text or msg.caption or "").strip())[:600]
+        set_state(user.id, mode="confirm",
+                  pending_msg=msg.message_id, pending_text=preview)
+        return await send_html(
+            context.bot, user.id,
+            f"{e('rocket')} <b>Ready to send</b>\n\n"
+            f"<blockquote>{preview}</blockquote>\n\n"
+            f"{e('info')} An agent will be pulled into this chat. "
+            "Only send if you'll be here to reply.",
+            reply_markup=send_confirm_menu(),
+        )
+
+    # --- live conversation --------------------------------------------------
+    ref = st.get("last_ref")
+    if not ref:
+        row = open_ticket_for(user.id)
+        ref = row["ref"] if row else None
+    if not ref:
+        set_state(user.id, mode="await_message")
+        return await send_html(
+            context.bot, user.id,
+            f"{e('info')} Your ticket is closed. Send your request again and "
+            "we'll open a new one.",
+        )
+
     set_state(user.id, mode="live", last_ref=ref)
-    touch_ticket(ref)
+    touch_ticket(ref, by_user=True)
 
     await typing(context.bot, ADMIN_ID)
-
-    if first_contact:
-        row = get_ticket(ref)
-        header = await send_html(
-            context.bot, ADMIN_ID, ticket_admin_text(row),
-            reply_markup=ticket_keyboard(ref, row["status"], row["kind"]),
-        )
-        set_ticket_admin_msg(ref, header.message_id)
-    else:
-        header = await send_html(
-            context.bot, ADMIN_ID,
-            f"{e('bolt')} <b>Message</b> · <code>{ref}</code>\n"
-            f"{e('user')} {user_label(user)}",
-        )
+    header = await send_html(
+        context.bot, ADMIN_ID,
+        f"{e('bolt')} <b>Message</b> · <code>{ref}</code>\n"
+        f"{e('user')} {user_label(user)}",
+    )
     map_msg(header.message_id, user.id)
 
     copied = await context.bot.copy_message(
@@ -927,13 +1603,7 @@ async def on_user_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
     map_msg(copied.message_id, user.id)
 
-    if first_contact:
-        ack = (f"{e('check')} Your message has been delivered to our support team.\n"
-               f"{e('gem')} Ticket: <code>{ref}</code>\n")
-        ack += (f"{e('hourglass')} An agent will reply here shortly."
-                if within_hours() else f"\n{offline_notice()}")
-        await send_html(context.bot, user.id, ack, reply_markup=end_chat_menu())
-    elif not within_hours():
+    if not within_hours():
         await send_html(context.bot, user.id, offline_notice())
 
 
@@ -956,6 +1626,177 @@ async def _sync_admin_ticket(bot, ref: str):
         log.debug("Could not sync ticket card %s: %s", ref, exc)
 
 
+async def _do_ban(bot, user_id: int, reason: str = "") -> None:
+    ban_user(user_id, reason)
+    row = open_ticket_for(user_id)
+    if row:
+        set_ticket_status(row["ref"], "closed")
+        await _sync_admin_ticket(bot, row["ref"])
+    set_state(user_id, mode="idle", tool=None, last_ref=None,
+              pending_msg=None, pending_text=None)
+    try:
+        await send_html(bot, user_id, block_text("banned", reason))
+    except Exception:
+        pass
+
+
+async def penalise(bot, row, why: str):
+    """A ticket died because the customer went quiet. Charge for it."""
+    user_id = row["user_id"]
+    if is_trusted(user_id):
+        return
+    took_details = bool(row["got_details"])
+    strikes = add_strike(user_id, PAY_STRIKE if took_details else 1)
+    hits = bump_detail_hit(user_id) if took_details else 0
+
+    if took_details:
+        note = (
+            f"{e('cross')} <b>Ticket closed — no payment</b>\n\n"
+            f"{e('info')} <code>{row['ref']}</code>: you were sent payment "
+            f"details and didn't respond.\n"
+            f"{e('hourglass')} Strikes: <b>{strikes}/{STRIKE_LIMIT}</b> · "
+            f"unpaid details taken: <b>{hits}/{DETAIL_LIMIT}</b>."
+        )
+    else:
+        note = (
+            f"{e('cross')} <b>Ticket closed — no reply</b>\n\n"
+            f"{e('info')} <code>{row['ref']}</code> was closed because you "
+            f"stopped responding.\n"
+            f"{e('hourglass')} Strikes: <b>{strikes}/{STRIKE_LIMIT}</b>."
+        )
+    try:
+        await send_html(bot, user_id, note, reply_markup=main_menu())
+    except Forbidden:
+        deactivate_user(user_id)
+    except Exception as exc:
+        log.debug("Penalty notice failed for %s: %s", user_id, exc)
+
+    # repeat details-farming = automatic ban
+    if took_details and hits >= DETAIL_LIMIT:
+        await _do_ban(bot, user_id, "took payment details repeatedly, never paid")
+        return await send_html(
+            bot, ADMIN_ID,
+            f"🚫 <b>Auto-banned — details farmer</b>\n\n"
+            f"{e('user')} @{row['username']} — <code>{user_id}</code>\n"
+            f"{e('info')} Took your payment details {hits}× without paying "
+            f"(latest: <code>{row['ref']}</code>).\n"
+            f"{e('star')} Undo with <code>/unban {user_id}</code>",
+        )
+
+    if strikes >= STRIKE_LIMIT:
+        until = set_cooldown(user_id, COOLDOWN_HOURS)
+        try:
+            await send_html(bot, user_id, block_text("cooldown", until))
+        except Exception:
+            pass
+        await send_html(
+            bot, ADMIN_ID,
+            f"{e('cross')} <b>Time-waster paused</b>\n\n"
+            f"{e('user')} @{row['username']} — <code>{user_id}</code>\n"
+            f"{e('info')} {why} · strikes <b>{strikes}</b>"
+            + (f" · details taken <b>{hits}×</b>" if took_details else "") + "\n"
+            f"{e('hourglass')} On hold for {COOLDOWN_HOURS}h.",
+            reply_markup=strike_menu(user_id),
+        )
+    elif took_details:
+        await send_html(
+            bot, ADMIN_ID,
+            f"💳 <b>No payment</b> — <code>{row['ref']}</code>\n"
+            f"{e('user')} @{row['username']} — <code>{user_id}</code>\n"
+            f"{e('info')} Details taken {hits}× · strikes {strikes}",
+            reply_markup=strike_menu(user_id),
+        )
+
+
+async def on_pay_admin(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """You confirmed that the last message contained payment details."""
+    q = update.callback_query
+    if q.from_user.id != ADMIN_ID:
+        return await q.answer("Not authorised.", show_alert=True)
+    ref = q.data.split(":", 2)[2]
+    row = get_ticket(ref)
+    if not row or row["status"] == "closed":
+        return await q.answer("Ticket is closed.", show_alert=True)
+    deadline = start_pay_window(ref)
+    await q.answer(f"Timer running — ends {deadline[11:16]} WAT")
+    await _sync_admin_ticket(context.bot, ref)
+    try:
+        await send_html(
+            context.bot, row["user_id"], pay_prompt(deadline),
+            reply_markup=pay_window_menu(),
+        )
+    except Exception as exc:
+        log.warning("Pay prompt failed: %s", exc)
+    await q.edit_message_text(
+        f"{plain('check')} Delivered · 💳 payment window ends "
+        f"{deadline[11:16]} WAT"
+    )
+
+
+def pay_prompt(deadline: str) -> str:
+    return (
+        f"{e('gem')} <b>Payment details sent</b>\n\n"
+        f"{e('hourglass')} Please pay and send your receipt before "
+        f"<b>{deadline[11:16]} WAT</b>.\n\n"
+        f"{e('info')} If you go silent, this ticket closes automatically and "
+        f"a strike is recorded. Collecting our details "
+        f"{DETAIL_LIMIT} times without paying gets your access removed.\n"
+        f"{e('star')} Not ready? Tap <b>Cancel</b> — no strike for being honest."
+    )
+
+
+async def on_pay_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Customer tapped 'need more time' or 'cancel' during a payment window."""
+    q = update.callback_query
+    user = q.from_user
+    if await gate(context, user, q):
+        return
+    action = q.data.split(":", 1)[1]
+    row = open_ticket_for(user.id)
+    if not row:
+        await q.answer()
+        return await edit_html(q, welcome_text(), reply_markup=main_menu())
+
+    if action == "more":
+        deadline = extend_pay_window(row["ref"])
+        if not deadline:
+            await q.answer("Already extended once.", show_alert=True)
+            return
+        await q.answer("Extended.")
+        await send_html(
+            context.bot, ADMIN_ID,
+            f"{e('hourglass')} <code>{row['ref']}</code> — customer asked for "
+            f"{PAY_EXTEND_MIN} more minutes (until {deadline[11:16]} WAT).",
+        )
+        return await edit_html(
+            q,
+            f"{e('hourglass')} <b>Extended</b>\n\n"
+            f"New deadline: <b>{deadline[11:16]} WAT</b>. This is the only "
+            "extension available.",
+        )
+
+    # cancel — honest exit, no strike
+    clear_pay_window(row["ref"])
+    settle_ticket(row["ref"])
+    set_ticket_status(row["ref"], "closed")
+    set_state(user.id, mode="idle", tool=None, last_ref=None,
+              pending_msg=None, pending_text=None)
+    await _sync_admin_ticket(context.bot, row["ref"])
+    await q.answer("Order cancelled.")
+    await edit_html(
+        q,
+        f"{e('check')} <b>Order cancelled</b>\n\n"
+        "No strike recorded — thanks for telling us. Come back when you're "
+        "ready.",
+        reply_markup=main_menu(),
+    )
+    await send_html(
+        context.bot, ADMIN_ID,
+        f"{e('info')} <code>{row['ref']}</code> — customer cancelled before "
+        "paying. No strike applied.",
+    )
+
+
 async def on_ticket_action(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     if q.from_user.id != ADMIN_ID:
@@ -966,6 +1807,17 @@ async def on_ticket_action(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not row:
         return await q.answer("Ticket not found.", show_alert=True)
 
+    if action == "ban":
+        await _do_ban(context.bot, row["user_id"], f"ticket {ref}")
+        await q.answer(f"Banned {row['user_id']}", show_alert=True)
+        return await edit_html(
+            q,
+            f"{e('cross')} <b>Customer banned</b>\n\n"
+            f"{e('user')} <code>{row['user_id']}</code> (@{row['username']})\n"
+            f"{e('star')} Ticket <code>{ref}</code> closed.\n\n"
+            f"{e('info')} Undo with <code>/unban {row['user_id']}</code>",
+        )
+
     new_status = {
         "paid": "paid",
         "delivered": "delivered",
@@ -975,6 +1827,8 @@ async def on_ticket_action(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     set_ticket_status(ref, new_status)
     touch_ticket(ref)
+    if new_status in ("paid", "delivered"):
+        settle_ticket(ref)          # they paid — no penalty can follow
     await q.answer(f"Ticket {ref} → {new_status}")
 
     updated = get_ticket(ref)
@@ -1014,6 +1868,31 @@ async def on_ticket_action(update: Update, context: ContextTypes.DEFAULT_TYPE):
         deactivate_user(user_id)
     except Exception as exc:
         log.warning("Could not notify %s: %s", user_id, exc)
+
+
+async def on_strike_action(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Buttons attached to the auto-restriction alert."""
+    q = update.callback_query
+    if q.from_user.id != ADMIN_ID:
+        return await q.answer("Not authorised.", show_alert=True)
+
+    _, action, raw = q.data.split(":", 2)
+    user_id = int(raw)
+
+    if action == "ban":
+        await _do_ban(context.bot, user_id, "repeat time-waster")
+        await q.answer("Banned.")
+        return await edit_html(
+            q,
+            f"{e('cross')} <b>Banned</b> <code>{user_id}</code>\n"
+            f"{e('info')} Undo with <code>/unban {user_id}</code>",
+        )
+
+    unban_user(user_id)
+    await q.answer("Strikes cleared.")
+    await edit_html(
+        q, f"{e('check')} Strikes cleared for <code>{user_id}</code>."
+    )
 
 
 # ----------------------------------------------------------------------------
@@ -1251,16 +2130,72 @@ async def cmd_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # ----------------------------------------------------------------------------
 
 
+async def _close_and_charge(bot, row, why: str):
+    ref, user_id = row["ref"], row["user_id"]
+    set_ticket_status(ref, "closed")
+    set_state(user_id, mode="idle", tool=None, last_ref=None,
+              pending_msg=None, pending_text=None)
+    await _sync_admin_ticket(bot, ref)
+    await penalise(bot, row, why)
+    await asyncio.sleep(0.05)
+
+
+async def job_payments(context: ContextTypes.DEFAULT_TYPE):
+    """Nudge, then close, tickets where payment details went unanswered."""
+    for row in pay_reminder_tickets():
+        mark_reminded(row["ref"])
+        try:
+            await send_html(
+                context.bot, row["user_id"],
+                f"{e('hourglass')} <b>5 minutes left</b>\n\n"
+                f"Send your payment receipt for <code>{row['ref']}</code>, or "
+                "tap below. Silence closes the ticket and costs you a strike.",
+                reply_markup=pay_window_menu(),
+            )
+        except Forbidden:
+            deactivate_user(row["user_id"])
+        except Exception as exc:
+            log.debug("Pay reminder failed: %s", exc)
+
+    expired = pay_due_tickets()
+    for row in expired:
+        await _close_and_charge(
+            context.bot, row, "went silent after receiving payment details"
+        )
+    if expired:
+        log.info("Closed %d unpaid ticket(s)", len(expired))
+
+
+async def job_ghosts(context: ContextTypes.DEFAULT_TYPE):
+    """Close tickets where the agent replied and the customer vanished."""
+    rows = ghosted_tickets(GHOST_HOURS)
+    for row in rows:
+        await _close_and_charge(
+            context.bot, row, f"no reply for {GHOST_HOURS}h after an agent reply"
+        )
+    if rows:
+        log.info("Ghost-closed %d ticket(s)", len(rows))
+
+
 async def job_autoclose(context: ContextTypes.DEFAULT_TYPE):
     """Close tickets with no activity for IDLE_HOURS."""
     purge_relays()
+    await job_ghosts(context)
+
     rows = stale_tickets(IDLE_HOURS)
     if not rows:
         return
     for row in rows:
         ref, user_id = row["ref"], row["user_id"]
+        if row["got_details"]:
+            # they had the account details and never came back — charge it
+            await _close_and_charge(
+                context.bot, row, f"idle {IDLE_HOURS}h holding payment details"
+            )
+            continue
         set_ticket_status(ref, "closed")
-        set_state(user_id, mode="idle", tool=None, last_ref=None)
+        set_state(user_id, mode="idle", tool=None, last_ref=None,
+                  pending_msg=None, pending_text=None)
         await _sync_admin_ticket(context.bot, ref)
         try:
             await send_html(
@@ -1319,12 +2254,22 @@ async def admin_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"{e('hourglass')} <code>/open</code> — tickets still open\n"
         f"{e('rocket')} <code>/tools</code> — add or remove tools\n"
         f"{e('sparkle')} <code>/broadcast &lt;text&gt;</code> — message all users\n"
-        f"{e('cross')} <code>/close &lt;user_id&gt;</code> — close their ticket\n"
+        f"{e('cross')} <code>/close &lt;user_id&gt;</code> — close their ticket\n\n"
+        f"{e('cross')} <b>Moderation</b>\n"
+        f"<code>/ban &lt;user_id&gt; [reason]</code> — or reply to their message\n"
+        f"<code>/unban &lt;user_id&gt;</code> — also clears strikes\n"
+        f"<code>/banned</code> — banned, paused and striked users\n"
+        f"<code>/trust &lt;user_id&gt;</code> — skip screening for a regular\n\n"
         f"{e('globe')} <code>/status</code> — hours, users, jobs\n"
         f"{e('info')} <code>/emoji</code> — premium emoji status\n\n"
         f"{e('info')} <i>Editing one of your sent messages updates the "
         "customer's copy automatically.</i>\n"
-        f"Hours: <b>{hours_label()}</b> · auto-close after <b>{IDLE_HOURS}h</b> idle",
+        f"{e('info')} <i>Send an account number or wallet address and a "
+        f"{PAY_WINDOW_MIN}-minute payment window starts by itself. If it "
+        "doesn't fire, tap the 💳 button under \"Delivered.\"</i>\n"
+        f"Hours: <b>{hours_label()}</b> · idle close <b>{IDLE_HOURS}h</b> · "
+        f"ghost close <b>{GHOST_HOURS}h</b> · pause at <b>{STRIKE_LIMIT}</b> "
+        f"strikes · auto-ban at <b>{DETAIL_LIMIT}</b> unpaid details",
     )
 
 
@@ -1336,10 +2281,19 @@ async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
         live = conn.execute(
             "SELECT COUNT(*) c FROM state WHERE mode = 'live'"
         ).fetchone()["c"]
+        pending = conn.execute(
+            "SELECT COUNT(*) c FROM state WHERE mode = 'confirm'"
+        ).fetchone()["c"]
         open_t = conn.execute(
             "SELECT COUNT(*) c FROM tickets WHERE status != 'closed'"
         ).fetchone()["c"]
         relays = conn.execute("SELECT COUNT(*) c FROM relay_map").fetchone()["c"]
+        banned = conn.execute(
+            "SELECT COUNT(*) c FROM users WHERE banned = 1"
+        ).fetchone()["c"]
+        paused = conn.execute(
+            "SELECT COUNT(*) c FROM users WHERE cooldown_until > ?", (stamp(),)
+        ).fetchone()["c"]
     ping = f"every {PING_MINUTES} min" if PING_MINUTES else "disabled"
     await send_html(
         context.bot, ADMIN_ID,
@@ -1349,11 +2303,13 @@ async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"{e('info')} Hours: {hours_label()}\n"
         f"{e('user')} Reachable users: <b>{users}</b>\n"
         f"{e('sparkle')} Live chats: <b>{live}</b>\n"
+        f"{e('hourglass')} Awaiting confirm: <b>{pending}</b>\n"
         f"{e('hourglass')} Open tickets: <b>{open_t}</b>\n"
         f"{e('star')} Active tools: <b>{len(list_tools())}</b>\n"
+        f"{e('cross')} Banned: <b>{banned}</b> · paused: <b>{paused}</b>\n"
         f"{e('cross')} Unsendable replies tracked: <b>{relays}</b>\n"
         f"{e('rocket')} Keep-alive: <b>{ping}</b>\n"
-        f"{e('gem')} Auto-close: <b>{IDLE_HOURS}h idle</b>",
+        f"{e('gem')} Auto-close: <b>{IDLE_HOURS}h idle · {GHOST_HOURS}h ghost</b>",
     )
 
 
@@ -1364,6 +2320,98 @@ async def cmd_emoji(update: Update, context: ContextTypes.DEFAULT_TYPE):
         context.bot, ADMIN_ID,
         f"{e('info')} Premium emoji: <b>{state}</b>\n\n{sample}",
     )
+
+
+# --- moderation commands ----------------------------------------------------
+
+
+def _target_user(update: Update, context) -> tuple[int | None, str]:
+    """Resolve a user id from /cmd <id> [reason] or from a replied-to message."""
+    msg = update.effective_message
+    args = list(context.args or [])
+    if args:
+        try:
+            return int(args[0]), " ".join(args[1:]).strip()
+        except ValueError:
+            pass
+    if msg.reply_to_message:
+        uid = lookup_msg(msg.reply_to_message.message_id)
+        if uid:
+            return uid, " ".join(args).strip()
+    return None, ""
+
+
+async def cmd_ban(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    msg = update.effective_message
+    user_id, reason = _target_user(update, context)
+    if not user_id:
+        return await msg.reply_text(
+            "Usage: /ban <user_id> [reason] — or reply to the customer's "
+            "message with /ban."
+        )
+    if user_id == ADMIN_ID:
+        return await msg.reply_text("You can't ban yourself.")
+    await _do_ban(context.bot, user_id, reason)
+    await msg.reply_text(
+        f"{plain('cross')} Banned {user_id}."
+        + (f" Reason: {reason}" if reason else "")
+        + f"\nUndo: /unban {user_id}"
+    )
+
+
+async def cmd_unban(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    msg = update.effective_message
+    user_id, _ = _target_user(update, context)
+    if not user_id:
+        return await msg.reply_text("Usage: /unban <user_id>")
+    unban_user(user_id)
+    try:
+        await send_html(
+            context.bot, user_id,
+            f"{e('check')} <b>Access restored</b>\n\n"
+            "You can use the support portal again.",
+            reply_markup=main_menu(),
+        )
+    except Exception:
+        pass
+    await msg.reply_text(f"{plain('check')} Unbanned {user_id} (strikes cleared).")
+
+
+async def cmd_trust(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    msg = update.effective_message
+    user_id, _ = _target_user(update, context)
+    if not user_id:
+        return await msg.reply_text("Usage: /trust <user_id>")
+    trust_user(user_id, True)
+    await msg.reply_text(
+        f"{plain('check')} {user_id} is trusted — screening and strikes skipped."
+    )
+
+
+async def cmd_banned(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    rows = banned_list()
+    if not rows:
+        return await send_html(
+            context.bot, ADMIN_ID, f"{e('check')} No banned or flagged users."
+        )
+    out = [f"{e('cross')} <b>Banned & flagged</b>\n"]
+    for r in rows:
+        if r["banned"]:
+            tag = f"{plain('cross')} BANNED"
+        elif r["cooldown_until"] and r["cooldown_until"] > stamp():
+            tag = f"{plain('hourglass')} paused → {r['cooldown_until'][5:16]}"
+        else:
+            tag = f"{plain('info')} {r['strikes']} strike(s)"
+        handle = f"@{r['username']}" if r["username"] else (r["full_name"] or "—")
+        if r["detail_hits"]:
+            tag += f" · 💳 {r['detail_hits']}× unpaid details"
+        reason = f"\n     <i>{esc(r['ban_reason'])}</i>" if r["ban_reason"] else ""
+        out.append(
+            f"{e('star')} <code>{r['user_id']}</code> — {esc(handle)}\n"
+            f"     {tag}{reason}"
+        )
+    out.append(f"\n{e('info')} <code>/unban &lt;user_id&gt;</code> to restore.")
+    await send_html(context.bot, ADMIN_ID, "\n".join(out))
 
 
 async def cmd_broadcast(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1474,10 +2522,28 @@ async def admin_relay(update: Update, context: ContextTypes.DEFAULT_TYPE):
         row = open_ticket_for(user_id)
         ref = row["ref"] if row else None
         set_state(user_id, mode="live", last_ref=ref)
-        touch_ticket(ref)
+        mark_agent_reply(ref)
+
+        body = msg.text or msg.caption
+        if ref and looks_like_payment_details(body):
+            deadline = start_pay_window(ref)
+            await _sync_admin_ticket(context.bot, ref)
+            try:
+                await send_html(
+                    context.bot, user_id, pay_prompt(deadline),
+                    reply_markup=pay_window_menu(),
+                )
+            except Exception as exc:
+                log.warning("Pay prompt failed: %s", exc)
+            return await msg.reply_text(
+                f"{plain('check')} Delivered · 💳 payment details detected — "
+                f"they have until {deadline[11:16]} WAT",
+                reply_markup=unsend_button(msg.message_id),
+            )
+
         await msg.reply_text(
             f"{plain('check')} Delivered.",
-            reply_markup=unsend_button(msg.message_id),
+            reply_markup=delivered_menu(msg.message_id, ref),
         )
     except Forbidden:
         deactivate_user(user_id)
@@ -1503,12 +2569,27 @@ async def cmd_reply(update: Update, context: ContextTypes.DEFAULT_TYPE):
         map_relay(msg.message_id, user_id, sent.message_id,
                   text.replace("\n", " ")[:38])
         row = open_ticket_for(user_id)
-        set_state(user_id, mode="live", last_ref=row["ref"] if row else None)
-        if row:
-            touch_ticket(row["ref"])
+        ref = row["ref"] if row else None
+        set_state(user_id, mode="live", last_ref=ref)
+        if ref:
+            mark_agent_reply(ref)
+
+        if ref and looks_like_payment_details(text):
+            deadline = start_pay_window(ref)
+            await _sync_admin_ticket(context.bot, ref)
+            await send_html(
+                context.bot, user_id, pay_prompt(deadline),
+                reply_markup=pay_window_menu(),
+            )
+            return await msg.reply_text(
+                f"{plain('check')} Delivered · 💳 payment window until "
+                f"{deadline[11:16]} WAT",
+                reply_markup=unsend_button(msg.message_id),
+            )
+
         await msg.reply_text(
             f"{plain('check')} Delivered.",
-            reply_markup=unsend_button(msg.message_id),
+            reply_markup=delivered_menu(msg.message_id, ref),
         )
     except Forbidden:
         deactivate_user(user_id)
@@ -1557,7 +2638,8 @@ async def cmd_close(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if row:
         set_ticket_status(row["ref"], "closed")
         await _sync_admin_ticket(context.bot, row["ref"])
-    set_state(user_id, mode="idle", tool=None, last_ref=None)
+    set_state(user_id, mode="idle", tool=None, last_ref=None,
+              pending_msg=None, pending_text=None)
     try:
         await send_html(
             context.bot, user_id,
@@ -1601,16 +2683,25 @@ def main():
     app.add_handler(CommandHandler("emoji", cmd_emoji, filters=admin))
     app.add_handler(CommandHandler("status", cmd_status, filters=admin))
     app.add_handler(CommandHandler("admin", admin_help, filters=admin))
+    app.add_handler(CommandHandler("ban", cmd_ban, filters=admin))
+    app.add_handler(CommandHandler("unban", cmd_unban, filters=admin))
+    app.add_handler(CommandHandler("banned", cmd_banned, filters=admin))
+    app.add_handler(CommandHandler("trust", cmd_trust, filters=admin))
 
     app.add_handler(CommandHandler(["start", "menu", "help"], start))
 
     app.add_handler(CallbackQueryHandler(on_menu, pattern=r"^menu:"))
     app.add_handler(CallbackQueryHandler(on_tool, pattern=r"^tool:"))
     app.add_handler(CallbackQueryHandler(on_days, pattern=r"^days:"))
+    app.add_handler(CallbackQueryHandler(on_order_confirm, pattern=r"^ord:"))
+    app.add_handler(CallbackQueryHandler(on_send_confirm, pattern=r"^ok:"))
     app.add_handler(CallbackQueryHandler(on_ticket_action, pattern=r"^tk:"))
     app.add_handler(CallbackQueryHandler(on_tool_admin, pattern=r"^tl:"))
     app.add_handler(CallbackQueryHandler(on_broadcast_action, pattern=r"^bc:"))
     app.add_handler(CallbackQueryHandler(on_relay_delete, pattern=r"^rm:"))
+    app.add_handler(CallbackQueryHandler(on_strike_action, pattern=r"^bn:"))
+    app.add_handler(CallbackQueryHandler(on_pay_admin, pattern=r"^pd:"))
+    app.add_handler(CallbackQueryHandler(on_pay_user, pattern=r"^pay:"))
 
     # Edited messages must be caught BEFORE the relay handler, and both message
     # handlers need an explicit update type, or every edit is relayed as new.
@@ -1626,6 +2717,9 @@ def main():
     if app.job_queue:
         app.job_queue.run_repeating(
             job_autoclose, interval=900, first=120, name="autoclose"
+        )
+        app.job_queue.run_repeating(
+            job_payments, interval=60, first=30, name="payments"
         )
         if PING_MINUTES and WEBHOOK_URL:
             app.job_queue.run_repeating(
