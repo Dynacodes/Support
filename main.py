@@ -1,8 +1,14 @@
 """
-FropTools Support Bot — v7
+FropTools Support Bot — v8
 --------------------------
 v6 added the intent gate (screening + confirm step), strikes, cooldowns
-and bans. v7 adds the payment-details trap:
+and bans. v7 added the payment-details trap. v8 puts prices on the tools:
+every tool carries a USD and NGN price and a fixed access length, shown
+in the buy menu, the order confirmation and the ticket card, and editable
+from Telegram with /price. The duration menu is gone — all licenses run
+for DEFAULT_DAYS (60).
+
+The payment-details trap:
 
 The moment you send account/wallet details, the bot recognises them and
 starts a countdown. The customer must reply within the window or the
@@ -100,18 +106,19 @@ PAY_EXTEND_MIN = int(os.environ.get("PAY_EXTEND_MIN", "20"))
 PAY_STRIKE = int(os.environ.get("PAY_STRIKE", "2"))
 DETAIL_LIMIT = int(os.environ.get("DETAIL_LIMIT", "2"))
 
-DEFAULT_TOOLS = [
-    "FropLogger",
-    "FropTrack",
-    "FropPaypalFlash",
-    "FropCashappFlash",
-    "FropBybitFlash",
-    "FropBinanceFlash",
-    "FropZelleFlash",
-    "FropFlight",
-]
+DEFAULT_DAYS = int(os.environ.get("DEFAULT_DAYS", "60"))
 
-DURATIONS = [30, 60, 90, 120, 360]
+# name, USD, NGN — every tool is DEFAULT_DAYS of access
+DEFAULT_TOOLS = [
+    ("FropLogger",        30, 45000),
+    ("FropTrack",         25, 35000),
+    ("FropPaypalFlash",   20, 28000),
+    ("FropCashappFlash",  20, 28000),
+    ("FropBybitFlash",    20, 28000),
+    ("FropBinanceFlash",  20, 28000),
+    ("FropZelleFlash",    20, 28000),
+    ("FropFlight",        25, 35000),
+]
 
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
@@ -358,7 +365,10 @@ def init_db():
                 id       INTEGER PRIMARY KEY AUTOINCREMENT,
                 name     TEXT UNIQUE NOT NULL,
                 active   INTEGER DEFAULT 1,
-                position INTEGER DEFAULT 0
+                position INTEGER DEFAULT 0,
+                usd      REAL,
+                ngn      INTEGER,
+                days     INTEGER
             );
             """
         )
@@ -387,6 +397,8 @@ def init_db():
             ("pay_deadline", "pay_deadline TEXT"),
             ("pay_reminded", "pay_reminded INTEGER DEFAULT 0"),
             ("pay_extended", "pay_extended INTEGER DEFAULT 0"),
+            ("price_usd", "price_usd REAL"),
+            ("price_ngn", "price_ngn INTEGER"),
         ):
             if col not in cols:
                 conn.execute(f"ALTER TABLE tickets ADD COLUMN {ddl}")
@@ -416,11 +428,32 @@ def init_db():
         if "pending_text" not in scols:
             conn.execute("ALTER TABLE state ADD COLUMN pending_text TEXT")
 
+        # v8: prices on tools
+        tcols = {r["name"] for r in conn.execute("PRAGMA table_info(tools)")}
+        for col, ddl in (("usd", "usd REAL"), ("ngn", "ngn INTEGER"),
+                         ("days", "days INTEGER")):
+            if col not in tcols:
+                conn.execute(f"ALTER TABLE tools ADD COLUMN {ddl}")
+
         # seed the tool list on first run
         if not conn.execute("SELECT 1 FROM tools LIMIT 1").fetchone():
             conn.executemany(
-                "INSERT INTO tools (name, position) VALUES (?,?)",
-                [(n, i) for i, n in enumerate(DEFAULT_TOOLS)],
+                "INSERT INTO tools (name, position, usd, ngn, days) "
+                "VALUES (?,?,?,?,?)",
+                [(n, i, u, ngn, DEFAULT_DAYS)
+                 for i, (n, u, ngn) in enumerate(DEFAULT_TOOLS)],
+            )
+        else:
+            # existing install — fill in prices that aren't set yet
+            for name, usd, ngn in DEFAULT_TOOLS:
+                conn.execute(
+                    "UPDATE tools SET usd = ?, ngn = ?, "
+                    "days = COALESCE(days, ?) WHERE lower(name) = lower(?) "
+                    "AND usd IS NULL",
+                    (usd, ngn, DEFAULT_DAYS, name),
+                )
+            conn.execute(
+                "UPDATE tools SET days = ? WHERE days IS NULL", (DEFAULT_DAYS,)
             )
 
 
@@ -443,23 +476,63 @@ def tool_by_id(tool_id: int):
         ).fetchone()
 
 
-def add_tool(name: str) -> bool:
+def price_label(row) -> str:
+    """'$25 · ₦35,000' — whichever halves are set."""
+    bits = []
+    if row["usd"]:
+        usd = row["usd"]
+        bits.append(f"${usd:g}")
+    if row["ngn"]:
+        bits.append(f"₦{int(row['ngn']):,}")
+    return " · ".join(bits) if bits else "price on request"
+
+
+def tool_days(row) -> int:
+    return int(row["days"] or DEFAULT_DAYS)
+
+
+def add_tool(name: str, usd=None, ngn=None, days: int = DEFAULT_DAYS) -> bool:
     with db() as conn:
         row = conn.execute(
-            "SELECT id, active FROM tools WHERE name = ?", (name,)
+            "SELECT id, active FROM tools WHERE lower(name) = lower(?)", (name,)
         ).fetchone()
         if row:
-            if row["active"]:
-                return False
-            conn.execute("UPDATE tools SET active = 1 WHERE id = ?", (row["id"],))
-            return True
+            conn.execute(
+                "UPDATE tools SET active = 1, usd = ?, ngn = ?, days = ? "
+                "WHERE id = ?", (usd, ngn, days, row["id"]),
+            )
+            return not row["active"]
         pos = conn.execute(
             "SELECT COALESCE(MAX(position), 0) + 1 p FROM tools"
         ).fetchone()["p"]
         conn.execute(
-            "INSERT INTO tools (name, position) VALUES (?,?)", (name, pos)
+            "INSERT INTO tools (name, position, usd, ngn, days) VALUES (?,?,?,?,?)",
+            (name, pos, usd, ngn, days),
         )
     return True
+
+
+def set_price(tool_id: int, usd=None, ngn=None, days=None):
+    with db() as conn:
+        conn.execute(
+            "UPDATE tools SET usd = COALESCE(?, usd), ngn = COALESCE(?, ngn), "
+            "days = COALESCE(?, days) WHERE id = ?", (usd, ngn, days, tool_id),
+        )
+
+
+def find_tool(term: str):
+    """Look a tool up by id or by (partial) name."""
+    with db() as conn:
+        if term.isdigit():
+            row = conn.execute(
+                "SELECT * FROM tools WHERE id = ?", (int(term),)
+            ).fetchone()
+            if row:
+                return row
+        return conn.execute(
+            "SELECT * FROM tools WHERE lower(name) LIKE lower(?) "
+            "ORDER BY active DESC, position LIMIT 1", (f"%{term}%",)
+        ).fetchone()
 
 
 def remove_tool(tool_id: int):
@@ -622,7 +695,8 @@ def block_text(kind: str, detail: str) -> str:
     if kind == "banned":
         why = f"\n{e('info')} Reason: <i>{esc(detail)}</i>" if detail else ""
         return (
-            f"{e('cross')} <b>Access restricted</b>\n\n"
+            f"{e('cross')} <b>Access restricted</b>\n"
+            f"<b>You are banned.</b>\n\n"
             f"Your access to this support bot has been revoked.{why}"
         )
     when = detail[11:16] if len(detail) >= 16 else detail
@@ -805,18 +879,28 @@ def new_reference() -> str:
                 return ref
 
 
-def create_ticket(user, kind, tool=None, days=None) -> str:
+def create_ticket(user, kind, tool=None, days=None, usd=None, ngn=None) -> str:
     ref = new_reference()
     now = stamp()
     with db() as conn:
         conn.execute(
             "INSERT INTO tickets (ref, user_id, username, tool, days, status, "
-            "created_at, kind, last_activity) VALUES (?,?,?,?,?,?,?,?,?)",
+            "created_at, kind, last_activity, price_usd, price_ngn) "
+            "VALUES (?,?,?,?,?,?,?,?,?,?,?)",
             (ref, user.id, user.username or user.full_name, tool, days,
              "awaiting_payment" if kind == "license" else "open",
-             now, kind, now),
+             now, kind, now, usd, ngn),
         )
     return ref
+
+
+def ticket_price(row) -> str:
+    bits = []
+    if row["price_usd"]:
+        bits.append(f"${row['price_usd']:g}")
+    if row["price_ngn"]:
+        bits.append(f"₦{int(row['price_ngn']):,}")
+    return " · ".join(bits) if bits else "—"
 
 
 def get_ticket(ref: str):
@@ -1021,7 +1105,8 @@ def main_menu() -> InlineKeyboardMarkup:
 def tools_menu() -> InlineKeyboardMarkup:
     rows = [
         [InlineKeyboardButton(
-            f"{plain('star')}  {t['name']}", callback_data=f"tool:{t['id']}"
+            f"{plain('star')}  {t['name']} — {price_label(t)}",
+            callback_data=f"tool:{t['id']}",
         )]
         for t in list_tools()
     ]
@@ -1029,25 +1114,38 @@ def tools_menu() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(rows)
 
 
-def days_menu() -> InlineKeyboardMarkup:
-    rows, buf = [], []
-    for d in DURATIONS:
-        buf.append(InlineKeyboardButton(f"{d} days", callback_data=f"days:{d}"))
-        if len(buf) == 3:
-            rows.append(buf)
-            buf = []
-    if buf:
-        rows.append(buf)
-    rows.append([InlineKeyboardButton("‹  Back", callback_data="menu:buy")])
-    return InlineKeyboardMarkup(rows)
+def price_list_text() -> str:
+    rows = list_tools()
+    if not rows:
+        return f"{e('cross')} No tools are listed right now."
+    body = "\n".join(
+        f"{e('star')} <b>{r['name']}</b> — {price_label(r)} "
+        f"<i>({tool_days(r)} days)</i>" for r in rows
+    )
+    return (
+        f"{e('gem')} <b>Froptools Price List</b>\n\n{body}\n\n"
+        f"{e('info')} Every license is {DEFAULT_DAYS} days of access."
+    )
 
 
-def order_confirm_menu(days: int) -> InlineKeyboardMarkup:
+def order_summary(t) -> str:
+    return (
+        f"{e('gem')} <b>Confirm your order</b>\n\n"
+        f"{e('star')} Tool: <b>{t['name']}</b>\n"
+        f"{e('rocket')} Price: <b>{price_label(t)}</b>\n"
+        f"{e('hourglass')} Access: <b>{tool_days(t)} days</b>\n\n"
+        f"{e('info')} Confirming opens a live ticket with a real agent and you'll "
+        "be sent payment details. Only continue if you're paying today."
+    )
+
+
+def order_confirm_menu(tool_id: int) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([
         [InlineKeyboardButton(
-            f"{plain('check')}  Yes, I'm ready to pay", callback_data=f"ord:{days}"
+            f"{plain('check')}  Yes, I'm ready to pay",
+            callback_data=f"ord:{tool_id}",
         )],
-        [InlineKeyboardButton("‹  Change duration", callback_data="menu:buy")],
+        [InlineKeyboardButton("‹  Choose another tool", callback_data="menu:buy")],
     ])
 
 
@@ -1184,7 +1282,8 @@ def ticket_admin_text(row) -> str:
     if row["kind"] == "license":
         head = f"{e('gem')} <b>LICENSE REQUEST</b>"
         body = (f"{e('rocket')} Tool: <b>{row['tool']}</b>\n"
-                f"{e('hourglass')} Duration: <b>{row['days']} days</b>\n")
+                f"{e('gem')} Amount: <b>{ticket_price(row)}</b>\n"
+                f"{e('hourglass')} Access: <b>{row['days']} days</b>\n")
     else:
         head = f"{e('sparkle')} <b>SUPPORT TICKET</b>"
         body = ""
@@ -1199,7 +1298,7 @@ def ticket_admin_text(row) -> str:
 
 
 def duplicate_notice(row) -> str:
-    detail = (f"{row['tool']} · {row['days']} days"
+    detail = (f"{row['tool']} · {ticket_price(row)}"
               if row["kind"] == "license" else "support request")
     return (
         f"{e('info')} <b>You already have an open ticket</b>\n\n"
@@ -1353,22 +1452,6 @@ async def on_tool(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"{e('cross')} That tool is no longer available.",
             reply_markup=tools_menu(),
         )
-    set_state(q.from_user.id, tool=row["name"])
-    await edit_html(
-        q,
-        f"{e('star')} Tool: <b>{row['name']}</b>\n\n"
-        f"{e('hourglass')} <b>Choose your license duration</b>",
-        reply_markup=days_menu(),
-    )
-
-
-async def on_days(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Duration chosen — show a confirmation step instead of pinging admin."""
-    q = update.callback_query
-    if await gate(context, q.from_user, q):
-        return
-    await q.answer()
-    days = int(q.data.split(":", 1)[1])
     user = q.from_user
 
     existing = open_ticket_for(user.id)
@@ -1377,21 +1460,9 @@ async def on_days(update: Update, context: ContextTypes.DEFAULT_TYPE):
             q, duplicate_notice(existing), reply_markup=duplicate_menu()
         )
 
-    tool = get_state(user.id).get("tool")
-    if not tool:
-        return await edit_html(
-            q, f"{e('cross')} Session expired. Please start again.",
-            reply_markup=main_menu(),
-        )
-
+    set_state(user.id, tool=row["name"])
     await edit_html(
-        q,
-        f"{e('gem')} <b>Confirm your order</b>\n\n"
-        f"{e('star')} Tool: <b>{tool}</b>\n"
-        f"{e('hourglass')} Duration: <b>{days} days</b>\n\n"
-        f"{e('info')} Confirming opens a live ticket with a real agent. "
-        "Only continue if you intend to pay today.",
-        reply_markup=order_confirm_menu(days),
+        q, order_summary(row), reply_markup=order_confirm_menu(row["id"])
     )
 
 
@@ -1401,7 +1472,13 @@ async def on_order_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if await gate(context, user, q):
         return
     await q.answer()
-    days = int(q.data.split(":", 1)[1])
+
+    t = tool_by_id(int(q.data.split(":", 1)[1]))
+    if not t:
+        return await edit_html(
+            q, f"{e('cross')} That tool is no longer available.",
+            reply_markup=tools_menu(),
+        )
 
     existing = open_ticket_for(user.id)
     if existing:
@@ -1409,21 +1486,17 @@ async def on_order_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
             q, duplicate_notice(existing), reply_markup=duplicate_menu()
         )
 
-    tool = get_state(user.id).get("tool")
-    if not tool:
-        return await edit_html(
-            q, f"{e('cross')} Session expired. Please start again.",
-            reply_markup=main_menu(),
-        )
-
-    ref = create_ticket(user, "license", tool, days)
-    set_state(user.id, mode="live", last_ref=ref)
+    days = tool_days(t)
+    ref = create_ticket(user, "license", t["name"], days,
+                        usd=t["usd"], ngn=t["ngn"])
+    set_state(user.id, mode="live", tool=t["name"], last_ref=ref)
 
     text = (
         f"{e('check')} <b>Order Reference Generated</b>\n\n"
         f"{e('gem')} Reference: <code>{ref}</code>\n"
-        f"{e('star')} Tool: <b>{tool}</b>\n"
-        f"{e('hourglass')} Duration: <b>{days} days</b>\n\n"
+        f"{e('star')} Tool: <b>{t['name']}</b>\n"
+        f"{e('rocket')} Amount: <b>{price_label(t)}</b>\n"
+        f"{e('hourglass')} Access: <b>{days} days</b>\n\n"
     )
     text += (
         f"{e('bolt')} <i>Connecting you to a live agent to complete payment…</i>"
@@ -2067,10 +2140,17 @@ def tool_panel_text() -> str:
     if not rows:
         body = f"{e('cross')} <i>No active tools — customers can't buy.</i>"
     else:
-        body = "\n".join(f"{e('star')} {r['name']}" for r in rows)
+        body = "\n".join(
+            f"{e('star')} <b>{r['name']}</b> — {price_label(r)} "
+            f"<i>({tool_days(r)}d)</i>  <code>#{r['id']}</code>"
+            for r in rows
+        )
     return (
         f"{e('rocket')} <b>Tool Manager</b>\n\n{body}\n\n"
-        f"{e('info')} Tap a name to remove it, or add a new one below."
+        f"{e('info')} Tap a name to remove it, or add one below.\n"
+        f"{e('gem')} Change a price: "
+        f"<code>/price FropTrack 25 35000</code>\n"
+        f"{e('hourglass')} Add days too: <code>/price FropTrack 25 35000 90</code>"
     )
 
 
@@ -2106,7 +2186,9 @@ async def on_tool_admin(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return await edit_html(
             q,
             f"{e('rocket')} <b>Add a tool</b>\n\n"
-            f"{e('info')} Send the tool name as your next message.\n"
+            f"{e('info')} Send it as: <code>Name USD NGN [days]</code>\n"
+            f"{e('star')} Example: <code>FropVaultFlash 20 28000</code>\n"
+            f"{e('hourglass')} Days default to {DEFAULT_DAYS}.\n"
             "Send <code>/cancel</code> to abort.",
         )
 
@@ -2118,6 +2200,38 @@ async def on_tool_admin(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await edit_html(
             q, tool_panel_text(), reply_markup=tool_panel_keyboard()
         )
+
+
+async def cmd_price(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/price <tool> <usd> <ngn> [days]"""
+    msg = update.effective_message
+    args = list(context.args or [])
+    if len(args) < 2:
+        return await msg.reply_text(
+            "Usage: /price <tool> <usd> <ngn> [days]\n"
+            "Example: /price FropTrack 25 35000"
+        )
+    row = find_tool(args[0])
+    if not row:
+        return await msg.reply_text(f"{plain('cross')} No tool matching “{args[0]}”.")
+    nums = [a.replace("$", "").replace("₦", "").replace(",", "") for a in args[1:]]
+    try:
+        usd = float(nums[0])
+        ngn = int(float(nums[1])) if len(nums) > 1 else None
+        days = int(float(nums[2])) if len(nums) > 2 else None
+    except ValueError:
+        return await msg.reply_text("Prices must be numbers, e.g. 25 35000")
+    set_price(row["id"], usd, ngn, days)
+    updated = tool_by_id(row["id"])
+    await send_html(
+        context.bot, ADMIN_ID,
+        f"{e('check')} <b>{updated['name']}</b> → {price_label(updated)} "
+        f"({tool_days(updated)} days)",
+    )
+
+
+async def cmd_pricelist(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await send_html(context.bot, ADMIN_ID, price_list_text())
 
 
 async def cmd_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -2253,6 +2367,8 @@ async def admin_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"{e('gem')} <code>/tickets</code> — recent tickets\n"
         f"{e('hourglass')} <code>/open</code> — tickets still open\n"
         f"{e('rocket')} <code>/tools</code> — add or remove tools\n"
+        f"{e('gem')} <code>/prices</code> — current price list\n"
+        f"{e('star')} <code>/price &lt;tool&gt; &lt;usd&gt; &lt;ngn&gt; [days]</code> — set a price\n"
         f"{e('sparkle')} <code>/broadcast &lt;text&gt;</code> — message all users\n"
         f"{e('cross')} <code>/close &lt;user_id&gt;</code> — close their ticket\n\n"
         f"{e('cross')} <b>Moderation</b>\n"
@@ -2475,15 +2591,32 @@ async def admin_relay(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # tool manager is waiting for a name
     if context.bot_data.get("awaiting_tool"):
         context.bot_data.pop("awaiting_tool", None)
-        name = (msg.text or "").strip()
+        raw = (msg.text or "").strip()
+        parts = [p for p in re.split(r"[|,]|\s+", raw) if p]
+        if not parts:
+            return await msg.reply_text(
+                f"{plain('cross')} Send: Name USD NGN [days]"
+            )
+        nums, words = [], []
+        for p in parts:
+            cleaned = p.replace("$", "").replace("₦", "").replace(",", "")
+            (nums if cleaned.replace(".", "", 1).isdigit() else words).append(
+                cleaned if cleaned.replace(".", "", 1).isdigit() else p
+            )
+        name = " ".join(words).strip()
         if not name or len(name) > 40:
             return await msg.reply_text(
-                f"{plain('cross')} Send a plain tool name under 40 characters."
+                f"{plain('cross')} Send a plain tool name under 40 characters, "
+                "then the prices: FropVaultFlash 20 28000"
             )
-        ok = add_tool(name)
+        usd = float(nums[0]) if len(nums) > 0 else None
+        ngn = int(float(nums[1])) if len(nums) > 1 else None
+        days = int(float(nums[2])) if len(nums) > 2 else DEFAULT_DAYS
+        add_tool(name, usd, ngn, days)
+        row = find_tool(name)
         await msg.reply_text(
-            f"{plain('check')} Added “{name}”." if ok
-            else f"{plain('info')} “{name}” is already on the list."
+            f"{plain('check')} Saved “{name}” — "
+            f"{degrade(price_label(row))} ({tool_days(row)} days)."
         )
         return await send_html(
             context.bot, ADMIN_ID, tool_panel_text(),
@@ -2620,7 +2753,8 @@ async def _render_tickets(context, rows, title):
         return await send_html(context.bot, ADMIN_ID, f"{e('info')} Nothing here yet.")
     out = [f"{e('gem')} <b>{title}</b>\n"]
     for r in rows:
-        detail = f"{r['tool']} / {r['days']}d" if r["kind"] == "license" else "support"
+        detail = (f"{r['tool']} · {ticket_price(r)}"
+                  if r["kind"] == "license" else "support")
         out.append(
             f"{e('star')} <code>{r['ref']}</code> — {detail}\n"
             f"     @{r['username']} (<code>{r['user_id']}</code>)\n"
@@ -2678,6 +2812,9 @@ def main():
     app.add_handler(CommandHandler("open", cmd_open, filters=admin))
     app.add_handler(CommandHandler("close", cmd_close, filters=admin))
     app.add_handler(CommandHandler("tools", cmd_tools, filters=admin))
+    app.add_handler(CommandHandler("price", cmd_price, filters=admin))
+    app.add_handler(CommandHandler("prices", cmd_pricelist, filters=admin))
+    app.add_handler(CommandHandler("pricelist", cmd_pricelist, filters=admin))
     app.add_handler(CommandHandler("cancel", cmd_cancel, filters=admin))
     app.add_handler(CommandHandler("broadcast", cmd_broadcast, filters=admin))
     app.add_handler(CommandHandler("emoji", cmd_emoji, filters=admin))
@@ -2692,7 +2829,6 @@ def main():
 
     app.add_handler(CallbackQueryHandler(on_menu, pattern=r"^menu:"))
     app.add_handler(CallbackQueryHandler(on_tool, pattern=r"^tool:"))
-    app.add_handler(CallbackQueryHandler(on_days, pattern=r"^days:"))
     app.add_handler(CallbackQueryHandler(on_order_confirm, pattern=r"^ord:"))
     app.add_handler(CallbackQueryHandler(on_send_confirm, pattern=r"^ok:"))
     app.add_handler(CallbackQueryHandler(on_ticket_action, pattern=r"^tk:"))
