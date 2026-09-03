@@ -1,12 +1,13 @@
 """
-FropTools Support Bot — v8
+FropTools Support Bot — v9
 --------------------------
 v6 added the intent gate (screening + confirm step), strikes, cooldowns
 and bans. v7 added the payment-details trap. v8 puts prices on the tools:
 every tool carries a USD and NGN price and a fixed access length, shown
 in the buy menu, the order confirmation and the ticket card, and editable
 from Telegram with /price. The duration menu is gone — all licenses run
-for DEFAULT_DAYS (60).
+for DEFAULT_DAYS (60). v9 adds a second, explicit invoice confirmation
+before any ticket is created, with a stated ban warning for false claims.
 
 The payment-details trap:
 
@@ -1149,6 +1150,33 @@ def order_confirm_menu(tool_id: int) -> InlineKeyboardMarkup:
     ])
 
 
+def invoice_prompt(t) -> str:
+    return (
+        f"🧾 <b>Final confirmation</b>\n\n"
+        f"Do you confirm for an invoice to be generated?\n\n"
+        f"{e('star')} Tool: <b>{t['name']}</b>\n"
+        f"{e('gem')} Amount: <b>{price_label(t)}</b>\n"
+        f"{e('hourglass')} Access: <b>{tool_days(t)} days</b>\n\n"
+        f"{e('cross')} <b>A false claim could lead to your account being "
+        f"banned.</b>\n"
+        f"{e('info')} Confirming means you are paying today. Confirming and "
+        f"then going silent is recorded against you, and "
+        f"{DETAIL_LIMIT} unpaid invoices removes your access permanently."
+    )
+
+
+def invoice_confirm_menu(tool_id: int) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton(
+            f"{plain('check')}  I confirm — generate my invoice",
+            callback_data=f"inv:{tool_id}",
+        )],
+        [InlineKeyboardButton(
+            f"{plain('cross')}  No, not yet", callback_data="menu:home"
+        )],
+    ])
+
+
 def send_confirm_menu() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([
         [InlineKeyboardButton(
@@ -1467,11 +1495,39 @@ async def on_tool(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def on_order_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """'Ready to pay' tapped — ask for the final invoice confirmation."""
     q = update.callback_query
     user = q.from_user
     if await gate(context, user, q):
         return
     await q.answer()
+
+    t = tool_by_id(int(q.data.split(":", 1)[1]))
+    if not t:
+        return await edit_html(
+            q, f"{e('cross')} That tool is no longer available.",
+            reply_markup=tools_menu(),
+        )
+
+    existing = open_ticket_for(user.id)
+    if existing:
+        return await edit_html(
+            q, duplicate_notice(existing), reply_markup=duplicate_menu()
+        )
+
+    set_state(user.id, tool=t["name"])
+    await edit_html(
+        q, invoice_prompt(t), reply_markup=invoice_confirm_menu(t["id"])
+    )
+
+
+async def on_invoice_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Confirmed — generate the invoice and open the ticket."""
+    q = update.callback_query
+    user = q.from_user
+    if await gate(context, user, q):
+        return
+    await q.answer("Generating invoice…")
 
     t = tool_by_id(int(q.data.split(":", 1)[1]))
     if not t:
@@ -1492,10 +1548,10 @@ async def on_order_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
     set_state(user.id, mode="live", tool=t["name"], last_ref=ref)
 
     text = (
-        f"{e('check')} <b>Order Reference Generated</b>\n\n"
-        f"{e('gem')} Reference: <code>{ref}</code>\n"
+        f"🧾 <b>Invoice Generated</b>\n\n"
+        f"{e('gem')} Invoice: <code>{ref}</code>\n"
         f"{e('star')} Tool: <b>{t['name']}</b>\n"
-        f"{e('rocket')} Amount: <b>{price_label(t)}</b>\n"
+        f"{e('rocket')} Amount due: <b>{price_label(t)}</b>\n"
         f"{e('hourglass')} Access: <b>{days} days</b>\n\n"
     )
     text += (
@@ -2830,6 +2886,7 @@ def main():
     app.add_handler(CallbackQueryHandler(on_menu, pattern=r"^menu:"))
     app.add_handler(CallbackQueryHandler(on_tool, pattern=r"^tool:"))
     app.add_handler(CallbackQueryHandler(on_order_confirm, pattern=r"^ord:"))
+    app.add_handler(CallbackQueryHandler(on_invoice_confirm, pattern=r"^inv:"))
     app.add_handler(CallbackQueryHandler(on_send_confirm, pattern=r"^ok:"))
     app.add_handler(CallbackQueryHandler(on_ticket_action, pattern=r"^tk:"))
     app.add_handler(CallbackQueryHandler(on_tool_admin, pattern=r"^tl:"))
